@@ -10,8 +10,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-let telegramClient = null;
-
 // Health Check
 app.get("/", (req, res) => {
     res.json({
@@ -20,24 +18,28 @@ app.get("/", (req, res) => {
     });
 });
 
-// Start Server
-async function start() {
-    const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000;
 
 // Start Express FIRST
 app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
 });
 
-// Connect Telegram AFTER Express starts
+// Connect Telegram AFTER server starts
 startClient()
-    .then(client => {
+    .then((client) => {
         app.locals.telegramClient = client;
         console.log("✅ Telegram Connected");
     })
-    .catch(err => {
-        console.error("Telegram Error:", err);
+    .catch((err) => {
+        console.error("❌ Telegram Connection Error:", err);
     });
-}
 
-start();
+// Prevent app crash
+process.on("uncaughtException", (err) => {
+    console.error("Uncaught Exception:", err);
+});
+
+process.on("unhandledRejection", (err) => {
+    console.error("Unhandled Rejection:", err);
+});
