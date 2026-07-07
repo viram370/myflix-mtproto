@@ -39,3 +39,8 @@ async function startClient() {
 module.exports = {
   startClient,
 };
+if (require.main === module) {
+    startClient()
+        .then(() => console.log("Login completed"))
+        .catch(console.error);
+}
