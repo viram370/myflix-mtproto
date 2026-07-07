@@ -22,20 +22,22 @@ app.get("/", (req, res) => {
 
 // Start Server
 async function start() {
-    try {
-        telegramClient = await startClient();
+    const PORT = process.env.PORT || 3000;
 
-        app.locals.telegramClient = telegramClient;
+// Start Express FIRST
+app.listen(PORT, () => {
+    console.log(`🚀 Server running on port ${PORT}`);
+});
 
-        const PORT = process.env.PORT || 3000;
-
-        app.listen(PORT, () => {
-            console.log(`🚀 Server running on port ${PORT}`);
-        });
-
-    } catch (err) {
-        console.error(err);
-    }
+// Connect Telegram AFTER Express starts
+startClient()
+    .then(client => {
+        app.locals.telegramClient = client;
+        console.log("✅ Telegram Connected");
+    })
+    .catch(err => {
+        console.error("Telegram Error:", err);
+    });
 }
 
 start();
