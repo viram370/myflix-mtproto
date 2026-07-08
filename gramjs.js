@@ -28,11 +28,15 @@ async function startClient() {
     onError: (err) => console.log(err),
   });
 
-  console.log("✅ Telegram MTProto connected!");
-  console.log("\n===== SAVE THIS STRING =====\n");
-  console.log(client.session.save());
-  console.log("\n============================\n");
+  
+console.log("✅ Telegram MTProto connected!");
+console.log("\n===== SAVE THIS STRING =====\n");
 
+const fs = require("fs");
+fs.writeFileSync("session.txt", client.session.save());
+console.log("Session saved to session.txt");
+
+console.log("\n============================\n");
   return client;
 }
 
