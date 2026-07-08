@@ -1,5 +1,5 @@
 require("dotenv").config();
-
+app.use("/api/stream", require("./routes/stream"));
 const express = require("express");
 const cors = require("cors");
 
