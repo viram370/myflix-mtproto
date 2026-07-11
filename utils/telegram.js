@@ -28,7 +28,10 @@
  *     callers (routes/stream.js) can correctly report "unavailable" rather
  *     than incorrectly reporting "not found".
  *  4. Detects video media on both Api.Document (video attribute) and
- *     video/* mime-typed documents, including forwarded messages.
+ *     video/* mime-typed documents, including forwarded messages, and
+ *     refuses to hand back a document with a missing/invalid size (which
+ *     would otherwise silently break the byte-range math downstream in
+ *     routes/stream.js and produce a corrupted, unplayable response).
  */
 
 const { Api } = require("telegram");
@@ -316,11 +319,31 @@ async function getMessage(client, channelId, messageId) {
 }
 
 /**
+ * Best-effort conversion of a Document's `size` field (Number / BigInt /
+ * big-integer instance) to a plain JS Number, purely for validation/logging
+ * here. routes/stream.js does its own equivalent conversion for the actual
+ * byte-range math.
+ */
+function sizeToNumber(value) {
+    if (value === null || value === undefined) return NaN;
+    if (typeof value === "number") return value;
+    if (typeof value === "bigint") return Number(value);
+    if (typeof value.toJSNumber === "function") return value.toJSNumber();
+    return Number(value.toString());
+}
+
+/**
  * Check if a message contains playable video and return the underlying
  * Api.Document. Handles:
  *   - Native videos (DocumentAttributeVideo)
  *   - Documents uploaded as video/* mime type (no video attribute)
  *   - Forwarded messages (media shape is identical to originals in MTProto)
+ *
+ * Only ever returns a Document that is genuinely playable: it must be a
+ * real Api.Document (not DocumentEmpty) with a valid, positive size. A
+ * malformed/sizeless document would otherwise pass silently through here
+ * and only surface as a confusing failure deep in the byte-range math in
+ * routes/stream.js - better to catch and log it at the source.
  */
 function getVideoMedia(message) {
     if (!message || !message.media) {
@@ -335,8 +358,9 @@ function getVideoMedia(message) {
 
     const doc = media.document;
 
-    // DocumentEmpty has no attributes/mimeType - not playable.
+    // DocumentEmpty has no attributes/mimeType/size - not playable.
     if (doc.className !== "Document") {
+        console.warn(`[telegram] Message media document is not a real Document (className=${doc.className}).`);
         return null;
     }
 
@@ -347,14 +371,22 @@ function getVideoMedia(message) {
     const isVideoMime = typeof doc.mimeType === "string" && doc.mimeType.startsWith("video/");
     const isAnimatedOnly = attributes.some((attr) => attr.className === "DocumentAttributeAnimated");
 
-    if (hasVideoAttribute || isVideoMime) {
-        console.log(
-            `[telegram] Video media found (id=${doc.id}, mime=${doc.mimeType}, size=${doc.size}, animatedOnly=${isAnimatedOnly}).`
-        );
-        return doc;
+    if (!hasVideoAttribute && !isVideoMime) {
+        return null;
     }
 
-    return null;
+    const size = sizeToNumber(doc.size);
+    if (!Number.isFinite(size) || size <= 0) {
+        console.error(
+            `[telegram] Video document found but has no valid size (id=${doc.id}, rawSize=${doc.size}). Refusing to hand it off for streaming.`
+        );
+        return null;
+    }
+
+    console.log(
+        `[telegram] Video media found (id=${doc.id}, mime=${doc.mimeType}, size=${size}, animatedOnly=${isAnimatedOnly}).`
+    );
+    return doc;
 }
 
 module.exports = {
