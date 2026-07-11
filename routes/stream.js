@@ -56,6 +56,33 @@
  * pass the Document's dcId explicitly via iterDownload's own `dcId` option,
  * since that field isn't part of InputDocumentFileLocation's TL schema.
  *
+ * ---------------------------------------------------------------------
+ * FIX (playback still fails after the byte-integrity fix, even though full
+ * downloads succeed): the route only ever registered a GET handler. Express
+ * automatically dispatches HEAD requests to a matching GET route when no
+ * explicit HEAD handler exists (Route.prototype._handles_method falls back
+ * to 'get' for 'head'). Many Android WebViews / native players embedded in
+ * Telegram Mini Apps probe a video URL with a HEAD request first to read
+ * Accept-Ranges/Content-Length *before* issuing the real ranged GET used
+ * for actual playback. Because this route had no dedicated HEAD handler,
+ * that probe fell all the way through the full metadata-resolution +
+ * Telegram byte-streaming pipeline - i.e. a HEAD request silently
+ * triggered a full MTProto download attempt whose body Node then discards
+ * (HEAD responses never send a body). This is slow, wastes a full
+ * download's worth of Telegram round-trips, and can hit STALL_TIMEOUT_MS /
+ * hang the probe entirely - so the player's HEAD probe times out or
+ * errors, and it never gets to the real GET Range request at all,
+ * producing exactly the observed symptom: duration/thumbnail already known
+ * via some other path, play button present, but Play does nothing /
+ * immediately stops with "Could not play video. Try again later."
+ *
+ * A normal HTTP video server answers HEAD with just headers (Accept-Ranges,
+ * Content-Type, Content-Length, Content-Range if a Range header was sent)
+ * and an empty body - no bytes read from the backing store at all. This
+ * file now registers a real router.head() handler that does exactly that,
+ * sharing the same metadata-resolution logic as GET but never touching
+ * client.iterDownload().
+ *
  * Compatible with telegram@2.26.x and Render's container networking.
  */
 
@@ -103,6 +130,13 @@ const METADATA_TIMEOUT_MS = 15000;
 // If no bytes have been written to the response for this long mid-stream,
 // we assume the Telegram connection has stalled and abort cleanly.
 const STALL_TIMEOUT_MS = 30000;
+
+// How many leading bytes of the very first chunk actually written to the
+// response we log (hex), so a truncated/misaligned stream shows up
+// immediately in logs instead of only surfacing as a vague player error.
+// 16 bytes is enough to see whether we start with a valid ISO-BMFF box
+// header (e.g. "....ftyp" for MP4) or with garbage.
+const FIRST_BYTES_LOG_LENGTH = 16;
 
 const VALID_ID_REGEX = /^[a-zA-Z0-9_-]+$/;
 
@@ -213,7 +247,223 @@ function parseRange(rangeHeader, totalSize) {
 }
 
 // ---------------------------------------------------------------------------
-// Route
+// Shared metadata resolution (used by both GET and HEAD)
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolves :id all the way down to a usable { media, totalSize, mimeType,
+ * video } bundle, or writes an appropriate error response and returns null.
+ * Shared by GET (which goes on to stream bytes) and HEAD (which must
+ * answer with the exact same headers a GET would send, but WITHOUT ever
+ * calling client.iterDownload() / touching Telegram for actual file bytes).
+ */
+async function resolveStreamTarget(req, res, rid) {
+    const { id } = req.params;
+
+    if (!id || typeof id !== "string" || !VALID_ID_REGEX.test(id)) {
+        log(rid, "warn", "Invalid video id", { id });
+        res.status(400).json({ error: "Invalid video id" });
+        return null;
+    }
+
+    const client = req.app.locals.telegramClient;
+
+    if (!client) {
+        log(rid, "error", "Telegram client not initialized on app.locals");
+        res.status(503).json({ error: "Streaming service unavailable" });
+        return null;
+    }
+
+    if (!client.connected) {
+        try {
+            await withTimeout(client.connect(), METADATA_TIMEOUT_MS, "Telegram connect");
+        } catch (connectErr) {
+            log(rid, "error", "Telegram client failed to connect", {
+                message: connectErr.message,
+            });
+            res.status(503).json({ error: "Telegram is currently unavailable" });
+            return null;
+        }
+    }
+
+    log(rid, "info", "Loading Firestore document...", { id });
+
+    let doc;
+    try {
+        doc = await db.collection("videos").doc(id).get();
+    } catch (dbErr) {
+        log(rid, "error", "Firestore error while fetching video document", {
+            id,
+            message: dbErr.message,
+        });
+        res.status(500).json({ error: "Failed to load video metadata" });
+        return null;
+    }
+
+    if (!doc.exists) {
+        log(rid, "warn", "Video document not found", { id });
+        res.status(404).json({ error: "Video not found" });
+        return null;
+    }
+
+    const video = doc.data();
+
+    if (!video || !video.channelId || !video.messageId) {
+        log(rid, "warn", "Video document missing channelId/messageId", { id });
+        res.status(404).json({ error: "Video source metadata is incomplete" });
+        return null;
+    }
+
+    let message;
+    try {
+        message = await withTimeout(
+            getMessage(client, video.channelId, video.messageId),
+            METADATA_TIMEOUT_MS,
+            "Telegram getMessage"
+        );
+    } catch (tgErr) {
+        log(rid, "error", "Telegram getMessage failed", {
+            id,
+            message: tgErr.message,
+        });
+        res.status(503).json({ error: "Telegram is currently unavailable" });
+        return null;
+    }
+
+    if (!message) {
+        log(rid, "warn", "Telegram message not found", {
+            id,
+            channelId: video.channelId,
+            messageId: video.messageId,
+        });
+        res.status(404).json({ error: "Source message not found" });
+        return null;
+    }
+
+    const media = getVideoMedia(message);
+
+    if (!media) {
+        log(rid, "warn", "No video media on message", { id });
+        res.status(404).json({ error: "Video media not found" });
+        return null;
+    }
+
+    const totalSize = toNumber(media.size);
+
+    log(rid, "info", "Telegram document size", { id, totalSize });
+
+    if (!Number.isFinite(totalSize) || totalSize <= 0) {
+        log(rid, "error", "Unable to determine media size", { id });
+        res.status(500).json({ error: "Unable to determine video size" });
+        return null;
+    }
+
+    const mimeType =
+        media.mimeType && typeof media.mimeType === "string"
+            ? media.mimeType
+            : "video/mp4";
+
+    return { client, video, media, totalSize, mimeType };
+}
+
+/**
+ * Given a resolved target and the incoming request, parses the Range header
+ * and sets every header a normal HTTP video server would send (Accept-
+ * Ranges, Content-Type, Content-Length, Content-Range + 206 status when a
+ * Range was requested). Returns { start, end, contentLength, range } or
+ * null if an error response (416/400) was already written.
+ */
+function applyRangeHeaders(req, res, rid, id, totalSize, mimeType) {
+    log(rid, "info", "Requested range", { id, range: req.headers.range || "(full file)" });
+
+    let range;
+    try {
+        range = parseRange(req.headers.range, totalSize);
+    } catch (rangeErr) {
+        if (rangeErr.type === "RANGE_NOT_SATISFIABLE") {
+            log(rid, "warn", "Range not satisfiable", {
+                id,
+                range: req.headers.range,
+                totalSize,
+            });
+            res.set("Content-Range", `bytes */${totalSize}`);
+            res.status(416).json({ error: "Requested range not satisfiable" });
+            return null;
+        }
+
+        log(rid, "warn", "Malformed range header", {
+            id,
+            range: req.headers.range,
+        });
+        res.status(400).json({ error: "Malformed Range header" });
+        return null;
+    }
+
+    const start = range ? range.start : 0;
+    const end = range ? range.end : totalSize - 1;
+    const contentLength = end - start + 1;
+
+    log(rid, "info", "Actual range", { id, start, end, contentLength });
+
+    res.set({
+        "Accept-Ranges": "bytes",
+        "Content-Type": mimeType,
+        "Content-Length": String(contentLength),
+        "Cache-Control": "no-cache",
+    });
+
+    log(rid, "info", "Content-Length", { id, contentLength });
+
+    if (range) {
+        res.status(206);
+        res.set("Content-Range", `bytes ${start}-${end}/${totalSize}`);
+        log(rid, "info", "Content-Range", { id, value: `bytes ${start}-${end}/${totalSize}` });
+    } else {
+        res.status(200);
+    }
+
+    return { start, end, contentLength, range };
+}
+
+// ---------------------------------------------------------------------------
+// HEAD /:id - headers only, identical to what the GET would send, but never
+// touches Telegram for actual file bytes. This is what fixes players/
+// WebViews that probe with HEAD before issuing the real ranged GET.
+// ---------------------------------------------------------------------------
+
+router.head("/:id", async (req, res) => {
+    const rid = reqId();
+    const { id } = req.params;
+
+    try {
+        const target = await resolveStreamTarget(req, res, rid);
+        if (!target) return; // error response already written
+
+        const parsed = applyRangeHeaders(req, res, rid, id, target.totalSize, target.mimeType);
+        if (!parsed) return; // 416/400 already written
+
+        log(rid, "info", "HEAD request satisfied without touching Telegram", {
+            id,
+            range: req.headers.range || "(full file)",
+        });
+
+        res.end();
+    } catch (err) {
+        log(rid, "error", "Unhandled error in HEAD stream route", {
+            id,
+            message: err.message,
+            stack: err.stack,
+        });
+        if (!res.headersSent) {
+            res.status(500).json({ error: "Failed to resolve video metadata" });
+        } else if (!res.writableEnded) {
+            res.end();
+        }
+    }
+});
+
+// ---------------------------------------------------------------------------
+// GET /:id - actual byte streaming
 // ---------------------------------------------------------------------------
 
 router.get("/:id", async (req, res) => {
@@ -222,11 +472,21 @@ router.get("/:id", async (req, res) => {
     const { id } = req.params;
 
     let aborted = false;
+    let abortReason = null;
     let downloadIterator = null;
 
     // If the client disconnects mid-stream (closes tab, seeks again, etc.)
     // stop pulling bytes from Telegram immediately.
     const onClose = () => {
+        if (!aborted) {
+            // res 'close' also fires after a normal, successful res.end(),
+            // so only treat this as a genuine client-initiated abort if the
+            // response hadn't actually finished yet.
+            if (!res.writableEnded) {
+                abortReason = "client_disconnected";
+                log(rid, "warn", "Client connection closed before response finished", { id });
+            }
+        }
         aborted = true;
         if (downloadIterator && typeof downloadIterator.return === "function") {
             downloadIterator.return().catch(() => {});
@@ -235,164 +495,15 @@ router.get("/:id", async (req, res) => {
     res.on("close", onClose);
 
     try {
-        // ---------------------------------------------------------------
-        // 1. Validate :id
-        // ---------------------------------------------------------------
-        if (!id || typeof id !== "string" || !VALID_ID_REGEX.test(id)) {
-            log(rid, "warn", "Invalid video id", { id });
-            return res.status(400).json({ error: "Invalid video id" });
-        }
+        const target = await resolveStreamTarget(req, res, rid);
+        if (!target) return; // error response already written
 
-        // ---------------------------------------------------------------
-        // 2. Telegram client availability
-        // ---------------------------------------------------------------
-        const client = req.app.locals.telegramClient;
+        const { client, video, media, totalSize, mimeType } = target;
 
-        if (!client) {
-            log(rid, "error", "Telegram client not initialized on app.locals");
-            return res.status(503).json({ error: "Streaming service unavailable" });
-        }
+        const parsed = applyRangeHeaders(req, res, rid, id, totalSize, mimeType);
+        if (!parsed) return; // 416/400 already written
 
-        if (!client.connected) {
-            try {
-                await withTimeout(client.connect(), METADATA_TIMEOUT_MS, "Telegram connect");
-            } catch (connectErr) {
-                log(rid, "error", "Telegram client failed to connect", {
-                    message: connectErr.message,
-                });
-                return res.status(503).json({ error: "Telegram is currently unavailable" });
-            }
-        }
-
-        // ---------------------------------------------------------------
-        // 3. Load Firestore document
-        // ---------------------------------------------------------------
-        log(rid, "info", "Loading Firestore document...", { id });
-
-        let doc;
-        try {
-            doc = await db.collection("videos").doc(id).get();
-        } catch (dbErr) {
-            log(rid, "error", "Firestore error while fetching video document", {
-                id,
-                message: dbErr.message,
-            });
-            return res.status(500).json({ error: "Failed to load video metadata" });
-        }
-
-        if (!doc.exists) {
-            log(rid, "warn", "Video document not found", { id });
-            return res.status(404).json({ error: "Video not found" });
-        }
-
-        const video = doc.data();
-
-        if (!video || !video.channelId || !video.messageId) {
-            log(rid, "warn", "Video document missing channelId/messageId", { id });
-            return res.status(404).json({ error: "Video source metadata is incomplete" });
-        }
-
-        // ---------------------------------------------------------------
-        // 4. Resolve Telegram message
-        // ---------------------------------------------------------------
-        let message;
-        try {
-            message = await withTimeout(
-                getMessage(client, video.channelId, video.messageId),
-                METADATA_TIMEOUT_MS,
-                "Telegram getMessage"
-            );
-        } catch (tgErr) {
-            log(rid, "error", "Telegram getMessage failed", {
-                id,
-                message: tgErr.message,
-            });
-            return res.status(503).json({ error: "Telegram is currently unavailable" });
-        }
-
-        if (!message) {
-            log(rid, "warn", "Telegram message not found", {
-                id,
-                channelId: video.channelId,
-                messageId: video.messageId,
-            });
-            return res.status(404).json({ error: "Source message not found" });
-        }
-
-        // ---------------------------------------------------------------
-        // 5. Resolve video media
-        // ---------------------------------------------------------------
-        const media = getVideoMedia(message);
-
-        if (!media) {
-            log(rid, "warn", "No video media on message", { id });
-            return res.status(404).json({ error: "Video media not found" });
-        }
-
-        const totalSize = toNumber(media.size);
-
-        log(rid, "info", "Telegram document size", { id, totalSize });
-
-        if (!Number.isFinite(totalSize) || totalSize <= 0) {
-            log(rid, "error", "Unable to determine media size", { id });
-            return res.status(500).json({ error: "Unable to determine video size" });
-        }
-
-        const mimeType =
-            media.mimeType && typeof media.mimeType === "string"
-                ? media.mimeType
-                : "video/mp4";
-
-        // ---------------------------------------------------------------
-        // 6. Parse Range header
-        // ---------------------------------------------------------------
-        log(rid, "info", "Requested range", { id, range: req.headers.range || "(full file)" });
-
-        let range;
-        try {
-            range = parseRange(req.headers.range, totalSize);
-        } catch (rangeErr) {
-            if (rangeErr.type === "RANGE_NOT_SATISFIABLE") {
-                log(rid, "warn", "Range not satisfiable", {
-                    id,
-                    range: req.headers.range,
-                    totalSize,
-                });
-                res.set("Content-Range", `bytes */${totalSize}`);
-                return res.status(416).json({ error: "Requested range not satisfiable" });
-            }
-
-            log(rid, "warn", "Malformed range header", {
-                id,
-                range: req.headers.range,
-            });
-            return res.status(400).json({ error: "Malformed Range header" });
-        }
-
-        const start = range ? range.start : 0;
-        const end = range ? range.end : totalSize - 1;
-        const contentLength = end - start + 1;
-
-        log(rid, "info", "Actual range", { id, start, end, contentLength });
-
-        // ---------------------------------------------------------------
-        // 7 & 8. Set response headers
-        // ---------------------------------------------------------------
-        res.set({
-            "Accept-Ranges": "bytes",
-            "Content-Type": mimeType,
-            "Content-Length": String(contentLength),
-            "Cache-Control": "no-cache",
-        });
-
-        log(rid, "info", "Content-Length", { id, contentLength });
-
-        if (range) {
-            res.status(206);
-            res.set("Content-Range", `bytes ${start}-${end}/${totalSize}`);
-        } else {
-            res.status(200);
-        }
+        const { start, end, contentLength, range } = parsed;
 
         log(rid, "info", "Starting stream", {
             id,
@@ -408,7 +519,7 @@ router.get("/:id", async (req, res) => {
         });
 
         // ---------------------------------------------------------------
-        // 9-11. Stream from Telegram in chunks (no full-file buffering)
+        // Stream from Telegram in chunks (no full-file buffering)
         // ---------------------------------------------------------------
         // MTProto file offsets/limits must be aligned to the chosen chunk
         // size (offset must be an exact multiple of the requestSize used),
@@ -421,12 +532,12 @@ router.get("/:id", async (req, res) => {
         // IMPORTANT: GramJS's iterDownload `limit` option is the NUMBER OF
         // CHUNK REQUESTS to issue (identical semantics to Telethon's
         // iter_download), NOT a byte count. Passing a raw byte count here
-        // (as the previous version of this file did) is a silent
+        // (as an even older version of this file did) is a silent
         // correctness bug: it happens to never *under*-provision chunks
         // mathematically, but it obscures the real chunk budget and made
         // it impossible to reason about / detect early termination. We
         // compute the real number of requests needed, plus a small safety
-        // margin - the definitive safety net is the bytesSent === 
+        // margin - the definitive safety net is the bytesSent ===
         // contentLength check after the loop, not this number.
         const chunkLimit = Math.ceil(downloadWindowBytes / CHUNK_SIZE) + 4;
 
@@ -466,13 +577,19 @@ router.get("/:id", async (req, res) => {
         let bytesSent = 0;
         let rawBytesReceived = 0;
         let isFirstChunk = true;
+        let firstBytesLogged = false;
         let lastActivity = Date.now();
         let chunkIndex = 0;
 
         const stallGuard = setInterval(() => {
             if (aborted) return;
             if (Date.now() - lastActivity > STALL_TIMEOUT_MS) {
-                log(rid, "error", "Stream stalled, aborting", { id, bytesSent });
+                abortReason = "stall_timeout";
+                log(rid, "error", "Stream stalled, aborting", {
+                    id,
+                    bytesSent,
+                    stallTimeoutMs: STALL_TIMEOUT_MS,
+                });
                 aborted = true;
                 if (downloadIterator && typeof downloadIterator.return === "function") {
                     downloadIterator.return().catch(() => {});
@@ -520,6 +637,24 @@ router.get("/:id", async (req, res) => {
                 }
 
                 if (piece.length > 0) {
+                    // Diagnostic: log the leading bytes of exactly what we
+                    // are about to hand to the browser, once per request.
+                    // For a start=0 request this should begin with a valid
+                    // ISO-BMFF box (bytes 4-7 spelling "ftyp" for MP4) - if
+                    // it doesn't, the stream is misaligned/corrupt at the
+                    // source and no amount of Content-Length correctness
+                    // will make HTML5 <video> accept it.
+                    if (!firstBytesLogged) {
+                        firstBytesLogged = true;
+                        const preview = piece.subarray(0, Math.min(FIRST_BYTES_LOG_LENGTH, piece.length));
+                        log(rid, "info", "First bytes written to response", {
+                            id,
+                            requestedStart: start,
+                            hex: preview.toString("hex"),
+                            ascii: preview.toString("latin1").replace(/[^\x20-\x7e]/g, "."),
+                        });
+                    }
+
                     const canContinue = res.write(piece);
                     bytesSent += piece.length;
                     lastActivity = Date.now();
@@ -538,8 +673,9 @@ router.get("/:id", async (req, res) => {
         log(rid, "info", "Bytes written", { id, bytesSent, contentLength });
 
         if (aborted) {
-            log(rid, "warn", "Stream aborted before completion (client disconnected)", {
+            log(rid, "warn", "Stream aborted before completion", {
                 id,
+                reason: abortReason || "unknown",
                 bytesSent,
                 contentLength,
                 durationMs: Date.now() - startedAt,
@@ -549,7 +685,7 @@ router.get("/:id", async (req, res) => {
         }
 
         // ---------------------------------------------------------------
-        // 12. Integrity check: never let a short/corrupted body look like
+        // Integrity check: never let a short/corrupted body look like
         // a successful response. If we didn't write exactly the number of
         // bytes we promised in Content-Length, destroy the connection
         // instead of calling res.end() normally.
@@ -587,8 +723,10 @@ router.get("/:id", async (req, res) => {
             durationMs: Date.now() - startedAt,
         });
     } catch (err) {
+        abortReason = abortReason || "unhandled_error";
         log(rid, "error", "Unhandled error in stream route", {
             id,
+            reason: abortReason,
             message: err.message,
             stack: err.stack,
         });
