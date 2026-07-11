@@ -88,6 +88,7 @@
 
 const express = require("express");
 const router = express.Router();
+const crypto = require("crypto");
 
 const { db } = require("../services/firebase");
 const { getMessage, getVideoMedia, getFileLocation } = require("../utils/telegram");
@@ -137,6 +138,16 @@ const STALL_TIMEOUT_MS = 30000;
 // 16 bytes is enough to see whether we start with a valid ISO-BMFF box
 // header (e.g. "....ftyp" for MP4) or with garbage.
 const FIRST_BYTES_LOG_LENGTH = 16;
+
+// How many bytes of the actual response body (starting at the requested
+// Range start) we buffer in memory to SHA-256 for diagnostics. This lets
+// you verify, for any Range request, that the bytes we actually sent are
+// byte-identical to the source file at that offset - e.g. by running
+//   dd if=<a full download of the same video> bs=1 skip=<start> count=<n> | sha256sum
+// and comparing it to the "SHA-256 of streamed bytes (sample)" log line.
+// 1 MiB keeps memory bounded while still catching any misalignment, which
+// always shows up in the first chunk or two.
+const SHA256_SAMPLE_BYTES = 1024 * 1024;
 
 const VALID_ID_REGEX = /^[a-zA-Z0-9_-]+$/;
 
@@ -529,6 +540,20 @@ router.get("/:id", async (req, res) => {
         const skipBytes = start - alignedStart;
         const downloadWindowBytes = end - alignedStart + 1;
 
+        // Explicit HTTP-Range -> Telegram-offset translation, logged so it
+        // can be verified against the actual bytes that end up going out
+        // (see "First bytes written to response" / SHA-256 sample below).
+        // Invariant: alignedStart + skipBytes must equal `start` exactly.
+        log(rid, "info", "Range-to-Telegram offset translation", {
+            id,
+            requestedStart: start,
+            requestedEnd: end,
+            alignedStart,
+            skipBytes,
+            downloadWindowBytes,
+            chunkSize: CHUNK_SIZE,
+        });
+
         // IMPORTANT: GramJS's iterDownload `limit` option is the NUMBER OF
         // CHUNK REQUESTS to issue (identical semantics to Telethon's
         // iter_download), NOT a byte count. Passing a raw byte count here
@@ -576,10 +601,22 @@ router.get("/:id", async (req, res) => {
 
         let bytesSent = 0;
         let rawBytesReceived = 0;
-        let isFirstChunk = true;
-        let firstBytesLogged = false;
+        // Cumulative raw bytes discarded so far in order to reach `start`.
+        // Tracked incrementally across however many buffers iterDownload
+        // actually yields (see the trimming comment below for why this
+        // must NOT assume the first yielded buffer is one full
+        // requestSize-aligned chunk).
+        let skippedBytes = 0;
+        let firstByteGlobalOffset = null;
         let lastActivity = Date.now();
         let chunkIndex = 0;
+
+        // Bounded sample of the bytes actually written to the response,
+        // starting at `start`, used to compute a SHA-256 for diagnostics
+        // (see SHA256_SAMPLE_BYTES above).
+        const hashSampleLimit = Math.min(SHA256_SAMPLE_BYTES, contentLength);
+        const hashChunks = [];
+        let hashBytesCollected = 0;
 
         const stallGuard = setInterval(() => {
             if (aborted) return;
@@ -624,10 +661,41 @@ router.get("/:id", async (req, res) => {
 
                 let piece = chunk;
 
-                if (isFirstChunk) {
-                    isFirstChunk = false;
-                    if (skipBytes > 0) {
-                        piece = piece.subarray(skipBytes);
+                // ---------------------------------------------------------
+                // Trim leading bytes down to the exact requested `start`.
+                //
+                // IMPORTANT: this must NOT assume the first buffer yielded
+                // by iterDownload() is exactly one full requestSize-aligned
+                // chunk. GramJS's DownloadIter is not contractually
+                // guaranteed to yield buffers in lockstep with
+                // `requestSize` - it can yield fewer/smaller buffers before
+                // delivering a full chunk. The previous version trimmed
+                // `skipBytes` off ONLY the very first yielded buffer via
+                // `piece.subarray(skipBytes)`. If that first buffer was
+                // ever shorter than `skipBytes`, `subarray()` silently
+                // clamps to an empty buffer instead of throwing - so that
+                // trim step would drop to nothing, and every buffer AFTER
+                // it would then be written completely untrimmed, shifting
+                // every subsequent byte in the response by however many
+                // bytes were still owed. That produces exactly this
+                // symptom: headers/duration parse fine (they don't depend
+                // on this loop), but the actual media bytes are offset from
+                // where the browser thinks they are, so decoding fails
+                // partway in and the connection gets dropped.
+                //
+                // Fix: track cumulative raw bytes discarded so far
+                // (`skippedBytes`) and only trim as much of THIS buffer as
+                // is still owed, no matter how many buffers that spans.
+                if (skippedBytes < skipBytes) {
+                    const stillToSkip = skipBytes - skippedBytes;
+                    if (chunk.length <= stillToSkip) {
+                        // This whole buffer is still before `start` - drop
+                        // it entirely and keep waiting.
+                        skippedBytes += chunk.length;
+                        piece = piece.subarray(0, 0);
+                    } else {
+                        piece = piece.subarray(stillToSkip);
+                        skippedBytes += stillToSkip;
                     }
                 }
 
@@ -637,22 +705,45 @@ router.get("/:id", async (req, res) => {
                 }
 
                 if (piece.length > 0) {
-                    // Diagnostic: log the leading bytes of exactly what we
-                    // are about to hand to the browser, once per request.
-                    // For a start=0 request this should begin with a valid
-                    // ISO-BMFF box (bytes 4-7 spelling "ftyp" for MP4) - if
-                    // it doesn't, the stream is misaligned/corrupt at the
-                    // source and no amount of Content-Length correctness
-                    // will make HTML5 <video> accept it.
-                    if (!firstBytesLogged) {
-                        firstBytesLogged = true;
+                    // Diagnostic: verify + log the global file offset of
+                    // the very first byte we actually write, and its
+                    // leading bytes. By construction this must equal
+                    // `start` exactly (alignedStart + skippedBytes); if it
+                    // doesn't, log it loudly rather than silently shipping
+                    // misaligned bytes to the browser. For a start=0
+                    // request the bytes should begin with a valid ISO-BMFF
+                    // box (bytes 4-7 spelling "ftyp" for MP4).
+                    if (firstByteGlobalOffset === null) {
+                        firstByteGlobalOffset = alignedStart + skippedBytes;
+
+                        if (firstByteGlobalOffset !== start) {
+                            log(rid, "error", "ALIGNMENT MISMATCH: first written byte does not match requested Range start", {
+                                id,
+                                requestedStart: start,
+                                firstByteGlobalOffset,
+                                alignedStart,
+                                skipBytes,
+                                skippedBytes,
+                            });
+                        }
+
                         const preview = piece.subarray(0, Math.min(FIRST_BYTES_LOG_LENGTH, piece.length));
                         log(rid, "info", "First bytes written to response", {
                             id,
                             requestedStart: start,
+                            firstByteGlobalOffset,
                             hex: preview.toString("hex"),
                             ascii: preview.toString("latin1").replace(/[^\x20-\x7e]/g, "."),
                         });
+                    }
+
+                    // Collect a bounded sample of the bytes actually
+                    // written (starting at `start`) to hash for
+                    // diagnostics - see SHA256_SAMPLE_BYTES.
+                    if (hashBytesCollected < hashSampleLimit) {
+                        const take = Math.min(piece.length, hashSampleLimit - hashBytesCollected);
+                        hashChunks.push(Buffer.from(piece.subarray(0, take)));
+                        hashBytesCollected += take;
                     }
 
                     const canContinue = res.write(piece);
@@ -671,6 +762,21 @@ router.get("/:id", async (req, res) => {
         }
 
         log(rid, "info", "Bytes written", { id, bytesSent, contentLength });
+
+        if (hashChunks.length > 0) {
+            const sampleBuffer = Buffer.concat(hashChunks, hashBytesCollected);
+            const sha256 = crypto.createHash("sha256").update(sampleBuffer).digest("hex");
+            log(rid, "info", "SHA-256 of streamed bytes (sample)", {
+                id,
+                sampleByteRange: `${start}-${start + hashBytesCollected - 1}`,
+                sampleBytes: hashBytesCollected,
+                sha256,
+                howToVerify:
+                    "Compare against sha256(dd if=<full downloaded copy of this video> " +
+                    `bs=1 skip=${start} count=${hashBytesCollected} status=none) to confirm the ` +
+                    "streamed bytes are byte-identical to the source file at this offset.",
+            });
+        }
 
         if (aborted) {
             log(rid, "warn", "Stream aborted before completion", {
@@ -691,12 +797,13 @@ router.get("/:id", async (req, res) => {
         // instead of calling res.end() normally.
         // ---------------------------------------------------------------
         if (bytesSent !== contentLength) {
-            log(rid, "error", "Stream integrity check failed - byte count mismatch, aborting connection", {
+            log(rid, "error", "BYTES-WRITTEN MISMATCH: bytesWritten !== Content-Length - aborting connection instead of ending it", {
                 id,
                 requestedRange: req.headers.range || "(full file)",
                 actualRangeServed: `${start}-${end}`,
                 contentLength,
                 bytesWritten: bytesSent,
+                difference: contentLength - bytesSent,
                 telegramDocumentSize: totalSize,
             });
 
