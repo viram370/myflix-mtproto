@@ -46,6 +46,16 @@
  * connection instead of completing it, so the client sees a hard failure
  * instead of a silently corrupted "successful" download.
  *
+ * ---------------------------------------------------------------------
+ * FIX (Cannot cast Document to any kind of InputFileLocation): passing the
+ * raw Api.Document straight to iterDownload({ file: media }) depends on
+ * GramJS's internal FileLike -> InputFileLocation auto-cast recognizing a
+ * bare Document, which the installed version does not. We now build the
+ * Api.InputDocumentFileLocation ourselves via utils/telegram.js's
+ * getFileLocation() - a type every GramJS version accepts directly - and
+ * pass the Document's dcId explicitly via iterDownload's own `dcId` option,
+ * since that field isn't part of InputDocumentFileLocation's TL schema.
+ *
  * Compatible with telegram@2.26.x and Render's container networking.
  */
 
@@ -53,7 +63,7 @@ const express = require("express");
 const router = express.Router();
 
 const { db } = require("../services/firebase");
-const { getMessage, getVideoMedia } = require("../utils/telegram");
+const { getMessage, getVideoMedia, getFileLocation } = require("../utils/telegram");
 
 // "big-integer" is a transitive dependency of the "telegram" package and is
 // required to build correctly-typed 64-bit offsets for MTProto file downloads.
@@ -420,11 +430,37 @@ router.get("/:id", async (req, res) => {
         // contentLength check after the loop, not this number.
         const chunkLimit = Math.ceil(downloadWindowBytes / CHUNK_SIZE) + 4;
 
+        // Build a real Api.InputDocumentFileLocation ourselves rather than
+        // handing the raw Api.Document to iterDownload and relying on
+        // GramJS's internal auto-cast (see getFileLocation() in
+        // utils/telegram.js for why: that cast is what previously threw
+        // "Cannot cast Document to any kind of InputFileLocation"). dcId is
+        // not part of InputDocumentFileLocation's schema, so it must be
+        // passed to iterDownload separately - this is exactly what the
+        // auto-cast would have extracted from the Document for us.
+        let fileLocation;
+        try {
+            fileLocation = getFileLocation(media);
+        } catch (locErr) {
+            log(rid, "error", "Failed to build InputDocumentFileLocation", {
+                id,
+                message: locErr.message,
+            });
+            return res.status(500).json({ error: "Unable to prepare video for streaming" });
+        }
+
+        log(rid, "info", "Prepared file location", {
+            id,
+            docId: media.id?.toString?.() ?? String(media.id),
+            dcId: media.dcId,
+        });
+
         downloadIterator = client.iterDownload({
-            file: media,
+            file: fileLocation,
             offset: bigInt(alignedStart),
             limit: chunkLimit,
             requestSize: CHUNK_SIZE,
+            dcId: media.dcId,
         });
 
         let bytesSent = 0;
