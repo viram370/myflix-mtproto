@@ -14,6 +14,37 @@
  *   6. Stream the requested byte range from Telegram using
  *      client.iterDownload(), writing chunks straight to the response
  *      (no buffering of the whole file in memory / disk)
+ *   7. Verify the exact number of bytes written matches Content-Length
+ *      before closing the response cleanly - if it doesn't, the
+ *      connection is forcibly destroyed instead of being ended normally,
+ *      so the browser never mistakes a truncated body for a valid file.
+ *
+ * ---------------------------------------------------------------------
+ * FIX (playback corruption): GramJS's client.iterDownload({ limit, ... })
+ * treats `limit` as the NUMBER OF CHUNK REQUESTS to make (it mirrors
+ * Telethon's iter_download 1:1), NOT a byte count. The previous version of
+ * this file passed a raw byte count as `limit`, and combined with a 1 MiB
+ * `requestSize`, this meant:
+ *   - Telegram (depending on account tier / DC) can silently return a
+ *     chunk SHORTER than the requested size even before the real end of
+ *     the requested range.
+ *   - GramJS's DownloadIter treats any "shorter than requestSize" chunk
+ *     as end-of-stream and stops iterating entirely - even mid-range.
+ *   - The old code then called res.end() unconditionally once the
+ *     for-await loop finished, regardless of whether bytesSent actually
+ *     reached the Content-Length that had already been promised to the
+ *     browser in headers. This produced a "200/206 with a body shorter
+ *     than Content-Length" response: a classically corrupt HTTP response
+ *     that HTML5 <video> correctly refuses to play ("Could not play
+ *     video" / "The media could not be loaded"), even though bytes were
+ *     clearly being received.
+ *
+ * Fix: use a conservative, broadly-compatible requestSize (512 KiB),
+ * pass a correctly-computed chunk COUNT as `limit` (with headroom), log
+ * every short/unexpected chunk, and - critically - verify bytesSent ===
+ * Content-Length before ending the response. On mismatch we destroy the
+ * connection instead of completing it, so the client sees a hard failure
+ * instead of a silently corrupted "successful" download.
  *
  * Compatible with telegram@2.26.x and Render's container networking.
  */
@@ -34,9 +65,26 @@ const bigInt = require("big-integer");
 // Config
 // ---------------------------------------------------------------------------
 
-// Must be a multiple of 4096 (MTProto requirement for file offsets/limits).
-// 1 MiB is a safe, efficient default for both small clips and 2GB+ movies.
-const CHUNK_SIZE = 1024 * 1024; // 1 MiB
+// Must be a multiple of 4096 (MTProto requirement for file offsets/limits),
+// and offset must be an exact multiple of this value too (also enforced
+// below). 1 MiB is technically the protocol ceiling, but several account
+// tiers / DCs will silently serve less than that per request, which is
+// exactly what caused truncated/corrupted playback. 512 KiB is the
+// commonly-documented safe size that works reliably across regular (non-
+// premium) user accounts and all DCs. Override with
+// TELEGRAM_STREAM_CHUNK_SIZE (bytes) if you know your account supports more.
+const MIN_CHUNK_SIZE = 4096;
+const MAX_CHUNK_SIZE = 1024 * 1024; // hard MTProto ceiling for upload.getFile
+const DEFAULT_CHUNK_SIZE = 512 * 1024; // 512 KiB - safe default
+
+function resolveChunkSize() {
+    const raw = Number(process.env.TELEGRAM_STREAM_CHUNK_SIZE);
+    if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_CHUNK_SIZE;
+    const rounded = Math.floor(raw / MIN_CHUNK_SIZE) * MIN_CHUNK_SIZE;
+    return Math.min(Math.max(rounded, MIN_CHUNK_SIZE), MAX_CHUNK_SIZE);
+}
+
+const CHUNK_SIZE = resolveChunkSize();
 
 // How long we allow Telegram metadata calls (getMessage) to hang before
 // treating the connection as unavailable.
@@ -209,6 +257,8 @@ router.get("/:id", async (req, res) => {
         // ---------------------------------------------------------------
         // 3. Load Firestore document
         // ---------------------------------------------------------------
+        log(rid, "info", "Loading Firestore document...", { id });
+
         let doc;
         try {
             doc = await db.collection("videos").doc(id).get();
@@ -271,6 +321,8 @@ router.get("/:id", async (req, res) => {
 
         const totalSize = toNumber(media.size);
 
+        log(rid, "info", "Telegram document size", { id, totalSize });
+
         if (!Number.isFinite(totalSize) || totalSize <= 0) {
             log(rid, "error", "Unable to determine media size", { id });
             return res.status(500).json({ error: "Unable to determine video size" });
@@ -284,6 +336,8 @@ router.get("/:id", async (req, res) => {
         // ---------------------------------------------------------------
         // 6. Parse Range header
         // ---------------------------------------------------------------
+        log(rid, "info", "Requested range", { id, range: req.headers.range || "(full file)" });
+
         let range;
         try {
             range = parseRange(req.headers.range, totalSize);
@@ -309,6 +363,8 @@ router.get("/:id", async (req, res) => {
         const end = range ? range.end : totalSize - 1;
         const contentLength = end - start + 1;
 
+        log(rid, "info", "Actual range", { id, start, end, contentLength });
+
         // ---------------------------------------------------------------
         // 7 & 8. Set response headers
         // ---------------------------------------------------------------
@@ -318,6 +374,8 @@ router.get("/:id", async (req, res) => {
             "Content-Length": String(contentLength),
             "Cache-Control": "no-cache",
         });
+
+        log(rid, "info", "Content-Length", { id, contentLength });
 
         if (range) {
             res.status(206);
@@ -334,29 +392,46 @@ router.get("/:id", async (req, res) => {
             start,
             end,
             totalSize,
+            contentLength,
+            chunkSize: CHUNK_SIZE,
             partial: !!range,
         });
 
         // ---------------------------------------------------------------
         // 9-11. Stream from Telegram in chunks (no full-file buffering)
         // ---------------------------------------------------------------
-        // MTProto file offsets/limits must be aligned to 4096-byte boundaries,
+        // MTProto file offsets/limits must be aligned to the chosen chunk
+        // size (offset must be an exact multiple of the requestSize used),
         // so we download from the aligned start and trim the leading bytes
         // of the first chunk to land exactly on the requested `start`.
         const alignedStart = start - (start % CHUNK_SIZE);
         const skipBytes = start - alignedStart;
-        const downloadLimit = end - alignedStart + 1;
+        const downloadWindowBytes = end - alignedStart + 1;
+
+        // IMPORTANT: GramJS's iterDownload `limit` option is the NUMBER OF
+        // CHUNK REQUESTS to issue (identical semantics to Telethon's
+        // iter_download), NOT a byte count. Passing a raw byte count here
+        // (as the previous version of this file did) is a silent
+        // correctness bug: it happens to never *under*-provision chunks
+        // mathematically, but it obscures the real chunk budget and made
+        // it impossible to reason about / detect early termination. We
+        // compute the real number of requests needed, plus a small safety
+        // margin - the definitive safety net is the bytesSent === 
+        // contentLength check after the loop, not this number.
+        const chunkLimit = Math.ceil(downloadWindowBytes / CHUNK_SIZE) + 4;
 
         downloadIterator = client.iterDownload({
             file: media,
             offset: bigInt(alignedStart),
-            limit: downloadLimit,
+            limit: chunkLimit,
             requestSize: CHUNK_SIZE,
         });
 
         let bytesSent = 0;
+        let rawBytesReceived = 0;
         let isFirstChunk = true;
         let lastActivity = Date.now();
+        let chunkIndex = 0;
 
         const stallGuard = setInterval(() => {
             if (aborted) return;
@@ -372,6 +447,27 @@ router.get("/:id", async (req, res) => {
         try {
             for await (const chunk of downloadIterator) {
                 if (aborted) break;
+
+                chunkIndex += 1;
+                rawBytesReceived += chunk.length;
+
+                // A chunk shorter than requestSize before we've actually
+                // reached the end of our requested window means Telegram
+                // (or GramJS's own EOF heuristic) is cutting the download
+                // short. GramJS's DownloadIter stops iterating entirely
+                // the moment this happens, so this is the earliest point
+                // we can flag the anomaly - the post-loop byte check below
+                // is what actually prevents a corrupted response.
+                if (chunk.length < CHUNK_SIZE && rawBytesReceived < downloadWindowBytes) {
+                    log(rid, "warn", "Received a short chunk from Telegram before expected end of range", {
+                        id,
+                        chunkIndex,
+                        chunkLength: chunk.length,
+                        requestSize: CHUNK_SIZE,
+                        rawBytesReceived,
+                        downloadWindowBytes,
+                    });
+                }
 
                 let piece = chunk;
 
@@ -403,21 +499,57 @@ router.get("/:id", async (req, res) => {
             clearInterval(stallGuard);
         }
 
-        if (!aborted) {
-            res.end();
-            log(rid, "info", "Stream completed", {
+        log(rid, "info", "Bytes written", { id, bytesSent, contentLength });
+
+        if (aborted) {
+            log(rid, "warn", "Stream aborted before completion (client disconnected)", {
                 id,
                 bytesSent,
-                durationMs: Date.now() - startedAt,
-            });
-        } else {
-            log(rid, "warn", "Stream aborted before completion", {
-                id,
-                bytesSent,
+                contentLength,
                 durationMs: Date.now() - startedAt,
             });
             if (!res.writableEnded) res.end();
+            return;
         }
+
+        // ---------------------------------------------------------------
+        // 12. Integrity check: never let a short/corrupted body look like
+        // a successful response. If we didn't write exactly the number of
+        // bytes we promised in Content-Length, destroy the connection
+        // instead of calling res.end() normally.
+        // ---------------------------------------------------------------
+        if (bytesSent !== contentLength) {
+            log(rid, "error", "Stream integrity check failed - byte count mismatch, aborting connection", {
+                id,
+                requestedRange: req.headers.range || "(full file)",
+                actualRangeServed: `${start}-${end}`,
+                contentLength,
+                bytesWritten: bytesSent,
+                telegramDocumentSize: totalSize,
+            });
+
+            const integrityErr = new Error(
+                `Stream byte mismatch for ${id}: wrote ${bytesSent} bytes, expected ${contentLength} ` +
+                    `(document size ${totalSize})`
+            );
+
+            if (!res.writableEnded) {
+                res.destroy(integrityErr);
+            }
+            return;
+        }
+
+        res.end();
+
+        log(rid, "info", "Stream finished", {
+            id,
+            requestedRange: req.headers.range || "(full file)",
+            actualRangeServed: `${start}-${end}`,
+            contentLength,
+            bytesWritten: bytesSent,
+            telegramDocumentSize: totalSize,
+            durationMs: Date.now() - startedAt,
+        });
     } catch (err) {
         log(rid, "error", "Unhandled error in stream route", {
             id,
@@ -428,7 +560,11 @@ router.get("/:id", async (req, res) => {
         if (!res.headersSent) {
             res.status(500).json({ error: "Failed to stream video" });
         } else if (!res.writableEnded) {
-            res.end();
+            // Headers (and a Content-Length promise) were already sent -
+            // ending normally here would produce a response that looks
+            // complete but isn't. Destroy the connection so the client
+            // sees a hard failure instead of a silently corrupted file.
+            res.destroy(err);
         }
     } finally {
         res.off("close", onClose);
