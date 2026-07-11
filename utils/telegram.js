@@ -333,6 +333,40 @@ function sizeToNumber(value) {
 }
 
 /**
+ * Build a ready-to-use Api.InputDocumentFileLocation for a video Document.
+ *
+ * WHY THIS EXISTS: client.iterDownload({ file: <Api.Document> }) relies on
+ * GramJS's internal FileLike -> InputFileLocation cast helper to recognize
+ * a bare Api.Document and convert it. Depending on the exact installed
+ * GramJS version, that helper may not have a case for a raw Document (it
+ * commonly only recognizes MessageMediaDocument / Photo / already-cast
+ * InputFileLocation types), which throws:
+ *   "Cannot cast Document to any kind of InputFileLocation"
+ * The one type every version of that cast helper accepts unconditionally
+ * is an already-built Api.InputDocumentFileLocation (it's the terminal
+ * type the helper is trying to produce), so we build it ourselves instead
+ * of depending on GramJS's internal casting logic at all. This makes
+ * downloads work identically across GramJS versions.
+ *
+ * `dcId` is intentionally NOT part of InputDocumentFileLocation's TL
+ * schema, so callers must pass `doc.dcId` separately as iterDownload's
+ * top-level `dcId` option - this is exactly what the internal cast helper
+ * would have extracted from the Document for you.
+ */
+function getFileLocation(doc) {
+    if (!doc || doc.className !== "Document") {
+        throw new Error("getFileLocation requires a real Api.Document");
+    }
+
+    return new Api.InputDocumentFileLocation({
+        id: doc.id,
+        accessHash: doc.accessHash,
+        fileReference: doc.fileReference,
+        thumbSize: "", // "" = full file, not a thumbnail
+    });
+}
+
+/**
  * Check if a message contains playable video and return the underlying
  * Api.Document. Handles:
  *   - Native videos (DocumentAttributeVideo)
@@ -392,6 +426,7 @@ function getVideoMedia(message) {
 module.exports = {
     getMessage,
     getVideoMedia,
+    getFileLocation,
     // Exposed for diagnostics / potential reuse elsewhere.
     resolveChannel,
     invalidateChannelCache,
