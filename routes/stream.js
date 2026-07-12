@@ -582,6 +582,14 @@ router.get("/:id", async (req, res) => {
     let abortReason = null;
     let downloadIterator = null;
 
+    // Hoisted so the close handler (attached below, before any async work
+    // starts) can report exactly how far the request had gotten when the
+    // connection closed - instead of a bare "client_disconnected" that
+    // looks the same whether Telegram had barely started or was mid-file.
+    let bytesSent = 0;
+    let downloadAttemptStartedAt = null; // set right before iterDownload() is called
+    let firstChunkAttempted = false; // true once we've begun awaiting the first chunk
+
     // If the client disconnects mid-stream (closes tab, seeks again, etc.)
     // stop pulling bytes from Telegram immediately.
     const onClose = () => {
@@ -591,7 +599,24 @@ router.get("/:id", async (req, res) => {
             // response hadn't actually finished yet.
             if (!res.writableEnded) {
                 abortReason = "client_disconnected";
-                log(rid, "warn", "Client connection closed before response finished", { id });
+                const msSinceRequestStart = Date.now() - startedAt;
+                const msSinceDownloadStarted = downloadAttemptStartedAt
+                    ? Date.now() - downloadAttemptStartedAt
+                    : null;
+                log(rid, "warn", "Client connection closed before response finished", {
+                    id,
+                    bytesSentBeforeClose: bytesSent,
+                    firstChunkAttempted,
+                    msSinceRequestStart,
+                    msSinceDownloadStarted,
+                    // If msSinceDownloadStarted is small (a second or two)
+                    // and well under FIRST_CHUNK_TIMEOUT_MS, this was NOT
+                    // our own timeout firing - the client/proxy gave up on
+                    // its own, faster than Telegram had a chance to
+                    // respond. If downloadAttemptStartedAt is null, the
+                    // connection closed before we even called
+                    // iterDownload() at all.
+                });
             }
         }
         aborted = true;
@@ -611,6 +636,20 @@ router.get("/:id", async (req, res) => {
         if (!parsed) return; // 416/400 already written
 
         const { start, end, contentLength, range } = parsed;
+
+        // Flush headers to the client/any intermediate proxy immediately,
+        // before we start pulling data from Telegram. Express normally
+        // holds headers back until the first res.write()/res.end() call,
+        // which means the connection can look completely idle - no bytes
+        // of any kind - for however long the Telegram round trip takes.
+        // Some proxies and HTTP clients treat "no bytes at all for N
+        // seconds" as a dead connection and close it well before any
+        // reasonable data timeout would apply. Sending the 206/200 headers
+        // right away at least gives the client a live response to hold
+        // onto while it waits for the body.
+        if (typeof res.flushHeaders === "function") {
+            res.flushHeaders();
+        }
 
         log(rid, "info", "Starting stream", {
             id,
@@ -704,6 +743,17 @@ router.get("/:id", async (req, res) => {
             crossDc: clientMainDcId !== "unknown" && clientMainDcId !== media.dcId,
         });
 
+        downloadAttemptStartedAt = Date.now();
+        log(rid, "info", "Calling client.iterDownload()...", {
+            id,
+            file: "InputDocumentFileLocation",
+            offset: alignedStart,
+            offsetType: typeof bigInt(alignedStart),
+            limit: chunkLimit,
+            requestSize: CHUNK_SIZE,
+            dcId: media.dcId,
+        });
+
         downloadIterator = client.iterDownload({
             file: fileLocation,
             offset: bigInt(alignedStart),
@@ -712,7 +762,13 @@ router.get("/:id", async (req, res) => {
             dcId: media.dcId,
         });
 
-        let bytesSent = 0;
+        log(rid, "info", "iterDownload() returned an iterator object (synchronous call succeeded)", {
+            id,
+            hasAsyncIterator: typeof downloadIterator[Symbol.asyncIterator] === "function",
+            hasReturnMethod: typeof downloadIterator.return === "function",
+        });
+
+        bytesSent = 0;
         let rawBytesReceived = 0;
         // Cumulative raw bytes discarded so far in order to reach `start`.
         // Tracked incrementally across however many buffers iterDownload
@@ -776,6 +832,7 @@ router.get("/:id", async (req, res) => {
                 let result;
                 if (isFirstNext) {
                     isFirstNext = false;
+                    firstChunkAttempted = true;
                     try {
                         result = await withTimeout(
                             asyncIterator.next(),
@@ -783,18 +840,36 @@ router.get("/:id", async (req, res) => {
                             "Telegram iterDownload() first chunk"
                         );
                     } catch (firstChunkErr) {
+                        // withTimeout() throws a specific "... timed out
+                        // after Xms" message when the clock runs out; any
+                        // other message means the iterator itself actually
+                        // threw (e.g. a Telegram RPC error such as
+                        // FILE_REFERENCE_EXPIRED) rather than just being
+                        // slow - these need very different follow-up, so
+                        // log them distinctly instead of lumping both
+                        // under "timeout".
+                        const isTimeout = /timed out after/i.test(firstChunkErr.message || "");
                         firstChunkTimedOut = true;
-                        abortReason = "no_first_chunk";
-                        log(rid, "error", "No chunk received from Telegram within timeout - iterDownload() never yielded. Likely a DC migration/sender export stall, an unreachable DC IP from this container's egress, or an invalid file location", {
-                            id,
-                            fileDcId: media.dcId,
-                            clientMainDcId: client.session?.dcId ?? client._dcId ?? "unknown",
-                            offset: alignedStart,
-                            requestSize: CHUNK_SIZE,
-                            limit: chunkLimit,
-                            timeoutMs: FIRST_CHUNK_TIMEOUT_MS,
-                            message: firstChunkErr.message,
-                        });
+                        abortReason = isTimeout ? "no_first_chunk" : "first_chunk_exception";
+                        log(
+                            rid,
+                            "error",
+                            isTimeout
+                                ? "No chunk received from Telegram within timeout - iterDownload() never yielded. Likely a DC migration/sender export stall, an unreachable DC IP from this container's egress, or an invalid file location"
+                                : "iterDownload() THREW while producing the first chunk (not a timeout - a real exception)",
+                            {
+                                id,
+                                isTimeout,
+                                fileDcId: media.dcId,
+                                clientMainDcId: client.session?.dcId ?? client._dcId ?? "unknown",
+                                offset: alignedStart,
+                                requestSize: CHUNK_SIZE,
+                                limit: chunkLimit,
+                                timeoutMs: FIRST_CHUNK_TIMEOUT_MS,
+                                message: firstChunkErr.message,
+                                stack: firstChunkErr.stack,
+                            }
+                        );
                         // Intentionally NOT setting `aborted = true` here -
                         // that flag is reserved for genuine client
                         // disconnects / mid-stream stalls (see onClose and
@@ -809,7 +884,20 @@ router.get("/:id", async (req, res) => {
                         break;
                     }
                 } else {
-                    result = await asyncIterator.next();
+                    try {
+                        result = await asyncIterator.next();
+                    } catch (midStreamErr) {
+                        abortReason = "mid_stream_exception";
+                        log(rid, "error", "iterDownload() THREW mid-stream (after at least one prior chunk)", {
+                            id,
+                            chunkIndex,
+                            bytesSent,
+                            message: midStreamErr.message,
+                            stack: midStreamErr.stack,
+                        });
+                        aborted = true;
+                        break;
+                    }
                 }
 
                 if (result.done) break;
