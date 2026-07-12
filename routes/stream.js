@@ -145,6 +145,32 @@ const STALL_TIMEOUT_MS = 30000;
 // headers yet at this point (nothing has been written to `res`).
 const FIRST_CHUNK_TIMEOUT_MS = 12000;
 
+// Installed GramJS ("telegram" npm package) version, per package.json:
+// "telegram": "^2.26.22". iterDownload()'s documented shape for this
+// version range is: iterDownload(client, { file, offset, limit, stride,
+// chunkSize, requestSize, fileSize, dcId }) where `file` must already be
+// (or resolve to) an Api.TypeInputFileLocation - for a Document that's
+// Api.InputDocumentFileLocation, NOT Api.InputPhotoFileLocation (that's
+// for photos) and NOT a raw Api.Document. `offset` is a big-integer BYTE
+// offset into the file. `limit` is a REQUEST COUNT (number of upload.GetFile
+// RPCs to issue), not a byte count. `requestSize` is the BYTE size per RPC
+// (must be a multiple of 4096, max 1 MiB). All of this matches what this
+// file already does. This sandbox has no network access to diff against
+// the live npm registry/source for 2.26.22 line by line - if you want a
+// byte-for-byte confirmation, check `node_modules/telegram/client/downloads.js`
+// (or .ts source) directly in your deployment.
+//
+// Given the parameters check out against the documented shape, a hang
+// where iterDownload() never yields ANY chunk (not even an error) point
+// to the sender/DC-connection setup underneath it stalling, not a
+// parameter mismatch. As a resilience measure (and because it's the
+// higher-level, more stable, explicitly documented top-level API for
+// ranged downloads), if the low-level iterDownload() path fails to
+// produce a first chunk in time, we fall back to client.downloadFile()
+// with explicit start/end byte offsets, pulled in bounded sub-ranges so
+// memory stays capped at roughly CHUNK_SIZE per iteration.
+const FALLBACK_CHUNK_TIMEOUT_MS = 20000;
+
 // How many leading bytes of the very first chunk actually written to the
 // response we log (hex), so a truncated/misaligned stream shows up
 // immediately in logs instead of only surfacing as a vague player error.
@@ -215,6 +241,63 @@ function withTimeout(promise, ms, label) {
     });
 
     return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Fallback download path used when the low-level client.iterDownload()
+ * never produces a first chunk (see FIRST_CHUNK_TIMEOUT_MS). Uses
+ * client.downloadFile() - GramJS's higher-level, officially documented
+ * method for pulling an explicit byte range (`start`/`end`) - instead of
+ * iterDownload()'s manual offset/limit/requestSize bookkeeping. Because
+ * downloadFile() resolves a single byte range as one in-memory Buffer, we
+ * call it once per bounded sub-range (~CHUNK_SIZE each) rather than once
+ * for the whole request, so peak memory stays capped and we can still
+ * write to the response incrementally like a real stream. Each sub-range
+ * call is individually time-bounded so a repeat stall fails fast instead
+ * of hanging again.
+ *
+ * Yields Buffers covering [rangeStart, rangeEnd] inclusive, in order.
+ */
+async function* downloadFileFallback({ client, fileLocation, dcId, totalSize, rangeStart, rangeEnd, rid, id }) {
+    let cursor = rangeStart;
+
+    while (cursor <= rangeEnd) {
+        const subEnd = Math.min(cursor + CHUNK_SIZE - 1, rangeEnd);
+
+        log(rid, "info", "[fallback] Requesting sub-range via client.downloadFile()", {
+            id,
+            start: cursor,
+            end: subEnd,
+        });
+
+        const buffer = await withTimeout(
+            client.downloadFile(fileLocation, {
+                dcId,
+                fileSize: bigInt(totalSize),
+                start: cursor,
+                end: subEnd,
+                workers: 1,
+            }),
+            FALLBACK_CHUNK_TIMEOUT_MS,
+            "client.downloadFile() fallback sub-range"
+        );
+
+        if (!buffer || buffer.length === 0) {
+            throw new Error(
+                `client.downloadFile() fallback returned no data for byte range ${cursor}-${subEnd}`
+            );
+        }
+
+        log(rid, "info", "[fallback] Received sub-range from client.downloadFile()", {
+            id,
+            start: cursor,
+            end: subEnd,
+            bytes: buffer.length,
+        });
+
+        yield buffer;
+        cursor += buffer.length;
+    }
 }
 
 /**
@@ -712,7 +795,14 @@ router.get("/:id", async (req, res) => {
                             timeoutMs: FIRST_CHUNK_TIMEOUT_MS,
                             message: firstChunkErr.message,
                         });
-                        aborted = true;
+                        // Intentionally NOT setting `aborted = true` here -
+                        // that flag is reserved for genuine client
+                        // disconnects / mid-stream stalls (see onClose and
+                        // the stallGuard above). A first-chunk timeout on
+                        // the low-level iterDownload() path is recoverable:
+                        // we abandon just this iterator and try the
+                        // client.downloadFile() fallback below, as long as
+                        // the browser hasn't actually gone away.
                         if (typeof downloadIterator.return === "function") {
                             downloadIterator.return().catch(() => {});
                         }
@@ -858,12 +948,107 @@ router.get("/:id", async (req, res) => {
             clearInterval(stallGuard);
         }
 
+        if (firstChunkTimedOut && !aborted) {
+            log(rid, "warn", "Falling back to client.downloadFile() after iterDownload() produced no first chunk", {
+                id,
+                requestedRange: `${start}-${end}`,
+                fallbackChunkTimeoutMs: FALLBACK_CHUNK_TIMEOUT_MS,
+            });
+
+            lastActivity = Date.now();
+            const fallbackStallGuard = setInterval(() => {
+                if (aborted) return;
+                if (Date.now() - lastActivity > STALL_TIMEOUT_MS) {
+                    abortReason = "stall_timeout_fallback";
+                    log(rid, "error", "Fallback stream stalled, aborting", {
+                        id,
+                        bytesSent,
+                        stallTimeoutMs: STALL_TIMEOUT_MS,
+                    });
+                    aborted = true;
+                }
+            }, 5000);
+
+            try {
+                for await (const buffer of downloadFileFallback({
+                    client,
+                    fileLocation,
+                    dcId: media.dcId,
+                    totalSize,
+                    rangeStart: start,
+                    rangeEnd: end,
+                    rid,
+                    id,
+                })) {
+                    if (aborted) break;
+
+                    // downloadFile() was requested with the exact
+                    // start/end byte range, so - unlike the primary
+                    // iterDownload() path - no alignment/skip trimming is
+                    // needed here at all.
+                    let piece = buffer;
+                    const remaining = contentLength - bytesSent;
+                    if (piece.length > remaining) {
+                        piece = piece.subarray(0, remaining);
+                    }
+
+                    if (piece.length > 0) {
+                        if (firstByteGlobalOffset === null) {
+                            firstByteGlobalOffset = start;
+                            const preview = piece.subarray(0, Math.min(FIRST_BYTES_LOG_LENGTH, piece.length));
+                            log(rid, "info", "First bytes written to response (via client.downloadFile() fallback)", {
+                                id,
+                                requestedStart: start,
+                                firstByteGlobalOffset,
+                                hex: preview.toString("hex"),
+                                ascii: preview.toString("latin1").replace(/[^\x20-\x7e]/g, "."),
+                            });
+                        }
+
+                        if (hashBytesCollected < hashSampleLimit) {
+                            const take = Math.min(piece.length, hashSampleLimit - hashBytesCollected);
+                            hashChunks.push(Buffer.from(piece.subarray(0, take)));
+                            hashBytesCollected += take;
+                        }
+
+                        const canContinue = res.write(piece);
+                        bytesSent += piece.length;
+                        lastActivity = Date.now();
+
+                        if (!canContinue) {
+                            await new Promise((resolve) => res.once("drain", resolve));
+                        }
+                    }
+
+                    if (bytesSent >= contentLength) break;
+                }
+
+                if (bytesSent > 0) {
+                    // The fallback actually delivered data - clear the
+                    // timeout flag so the normal bytesSent === contentLength
+                    // integrity check below governs the outcome instead of
+                    // the unconditional 503 further down.
+                    firstChunkTimedOut = false;
+                    abortReason = null;
+                }
+            } catch (fallbackErr) {
+                log(rid, "error", "client.downloadFile() fallback also failed - both download paths are broken for this DC/file", {
+                    id,
+                    fileDcId: media.dcId,
+                    message: fallbackErr.message,
+                });
+            } finally {
+                clearInterval(fallbackStallGuard);
+            }
+        }
+
         if (firstChunkTimedOut) {
             if (!res.headersSent) {
-                // Nothing has been written yet, so we can still respond
-                // with a clean error instead of leaving the client to
-                // time out and disconnect on its own (which is what
-                // produced the ambiguous "client_disconnected" abort
+                // Nothing has been written yet (both the primary and
+                // fallback paths failed to deliver anything), so we can
+                // still respond with a clean error instead of leaving the
+                // client to time out and disconnect on its own (which is
+                // what produced the ambiguous "client_disconnected" abort
                 // reason previously - the real cause was always this).
                 return res.status(503).json({
                     error: "Telegram did not return video data in time. Please try again.",
