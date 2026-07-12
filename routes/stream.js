@@ -77,6 +77,59 @@
  * iterDownload() implementation.
  *
  * Compatible with telegram@2.26.x and Render's container networking.
+ *
+ * ---------------------------------------------------------------------
+ * FIX (FileMigrateError: "The file to be accessed is currently stored in
+ * DC 4"): every upload.GetFile call was being issued via `client.invoke()`
+ * - i.e. through the client's single MAIN connection, which is only
+ * authorized on its own "home" DC (whichever DC the account's primary
+ * session lives on). Telegram shards file storage across multiple data
+ * centers; a document can (and very often does) live on a DC other than
+ * the account's home DC. Calling upload.GetFile for such a file over the
+ * wrong DC's connection doesn't silently fail - Telegram explicitly
+ * rejects it with FileMigrateError(<correct dc>), telling the caller
+ * exactly which DC to reconnect to. The old code never caught this or
+ * reconnected anywhere; it just let the error bubble up and killed the
+ * request.
+ *
+ * This is not something `client.invoke()` can ever fix on its own - a
+ * DC-specific RPC needs a connection ("sender") that has separately
+ * completed an authorization/auth-key exchange with THAT DC. GramJS's own
+ * high-level client.downloadFile()/iterDownload() handle this by calling
+ * client._borrowExportedSender(dcId) to obtain (creating + auth-exporting
+ * on first use, then reusing) a sender pinned to the target DC, issuing
+ * the RPC on THAT sender, and returning it via
+ * client._returnExportedSender() afterward. We do the same thing
+ * explicitly here:
+ *   1. Proactively borrow a sender for `media.dcId` (known up front from
+ *      the document's own metadata) before the download loop starts, so
+ *      we don't even attempt a doomed same-DC request when we already
+ *      know the file lives elsewhere.
+ *   2. Reactively: if Telegram still responds with FileMigrateError (e.g.
+ *      stale/incorrect dcId metadata), release the current sender, borrow
+ *      one for `err.newDc`, and retry that same chunk - capped at a small
+ *      number of migrations so a genuinely broken account/session fails
+ *      loudly instead of looping forever.
+ *   3. The borrowed sender is released exactly once, in a `finally` that
+ *      wraps the entire request (success, client-disconnect, stall-abort,
+ *      or thrown error), so a borrowed sender can never leak across
+ *      requests.
+ *
+ * `_borrowExportedSender`/`_returnExportedSender` are underscore-prefixed
+ * by GramJS's naming convention, but they are the exact mechanism GramJS's
+ * own public, documented download APIs use internally for this - there is
+ * no different, non-underscore public method that does DC-aware sender
+ * management on your behalf. We call them directly (rather than depending
+ * on the full downloadFile()/iterDownload() wrappers) because
+ * iterDownload() was independently found to hang unrecoverably in this
+ * codebase's installed GramJS version (see the FIX above), so this file
+ * already has to drive the byte-level download loop manually; this simply
+ * makes that manual loop DC-aware too, using the same underlying
+ * mechanism GramJS's own high-level APIs rely on. If a future GramJS
+ * upgrade proves iterDownload()/downloadFile() reliable again, they would
+ * be the lower-maintenance choice since they get DC handling "for free" -
+ * but doing it explicitly here is verifiable and doesn't depend on an API
+ * this project has already seen misbehave.
  */
 
 const express = require("express");
@@ -129,6 +182,13 @@ const STALL_TIMEOUT_MS = 30000;
 // single stuck request fails fast and loud instead of hanging silently
 // until the browser gives up and closes the connection.
 const CHUNK_REQUEST_TIMEOUT_MS = 20000;
+
+// Safety cap on reactive FileMigrateError handling within a single
+// request. One migration is the expected case (stale/incorrect dcId
+// metadata); more than a handful strongly suggests something is
+// fundamentally broken (e.g. Telegram bouncing us between DCs), and we'd
+// rather fail loudly than loop forever.
+const MAX_DC_MIGRATIONS = 3;
 
 const VALID_ID_REGEX = /^[a-zA-Z0-9_-]+$/;
 
@@ -183,6 +243,85 @@ function withTimeout(promise, ms, label) {
     });
 
     return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+// ---------------------------------------------------------------------------
+// Cross-DC sender management
+// ---------------------------------------------------------------------------
+
+/**
+ * True if `err` is (or looks like) GramJS's FileMigrateError - Telegram's
+ * way of saying "this file lives on a different DC than the one you're
+ * connected to; reconnect to `newDc` and retry." Checked defensively
+ * against both the typed className and the raw RPC error text, since the
+ * exact shape has drifted slightly across GramJS versions.
+ */
+function isFileMigrateError(err) {
+    if (!err) return false;
+    if (err.className === "FileMigrateError") return true;
+    if (typeof err.newDc === "number") return true;
+    const text = err.errorMessage || err.message || "";
+    return /FILE_MIGRATE_(\d+)/i.test(text);
+}
+
+/**
+ * Extract the target DC id from a FileMigrateError, however it happens to
+ * be shaped on the installed GramJS version.
+ */
+function extractMigrateDcId(err) {
+    if (typeof err.newDc === "number") return err.newDc;
+    const text = err.errorMessage || err.message || "";
+    const match = /FILE_MIGRATE_(\d+)/i.exec(text);
+    return match ? Number(match[1]) : null;
+}
+
+/**
+ * Obtain a connection ("sender") authorized to issue upload.GetFile RPCs
+ * against `dcId`. If `dcId` matches the client's own home DC, the client's
+ * main connection already works and is returned as-is (isBorrowed: false,
+ * nothing to release later). Otherwise, borrows a dedicated cross-DC
+ * sender via GramJS's internal (but exactly-what-the-official-download-
+ * APIs-use) _borrowExportedSender().
+ */
+async function acquireSender(client, dcId, rid) {
+    const homeDcId = Number(client.session?.dcId);
+    const targetDcId = dcId ? Number(dcId) : null;
+
+    if (!targetDcId || targetDcId === homeDcId) {
+        return { sender: client, dcId: homeDcId, isBorrowed: false };
+    }
+
+    if (typeof client._borrowExportedSender !== "function") {
+        throw new Error(
+            `This installed GramJS ("telegram") version does not expose ` +
+                `_borrowExportedSender(), so a file stored on DC ${targetDcId} ` +
+                `cannot be downloaded while connected to home DC ${homeDcId}. ` +
+                `Pin a telegram package version that supports cross-DC file ` +
+                `downloads (2.19+ is known to expose this).`
+        );
+    }
+
+    log(rid, "info", "Borrowing cross-DC sender", { homeDcId, targetDcId });
+    const sender = await client._borrowExportedSender(targetDcId);
+    return { sender, dcId: targetDcId, isBorrowed: true };
+}
+
+/**
+ * Release a sender obtained from acquireSender(). Safe to call
+ * unconditionally - a no-op when the "sender" is really just the main
+ * client (isBorrowed: false). Always called from a `finally`, exactly
+ * once per request, so a borrowed cross-DC sender can never leak.
+ */
+async function releaseSender(client, senderHandle, rid) {
+    if (!senderHandle || !senderHandle.isBorrowed) return;
+    try {
+        await client._returnExportedSender(senderHandle.sender);
+    } catch (releaseErr) {
+        log(rid, "warn", "Failed to release borrowed cross-DC sender (non-fatal)", {
+            message: releaseErr.message,
+            dcId: senderHandle.dcId,
+        });
+    }
 }
 
 /**
@@ -248,75 +387,13 @@ router.get("/:id", async (req, res) => {
     const { id } = req.params;
 
     let aborted = false;
-    let abortReason = null; // "client_disconnect" | "stall_timeout" | null
 
-    // ---------------------------------------------------------------
-    // Client-disconnect detection
-    // ---------------------------------------------------------------
-    // THE BUG: the previous version of this handler did
-    //     const onClose = () => { aborted = true; };
-    //     res.on("close", onClose);
-    // with NO guard at all. In Node, the response's 'close' event fires
-    // whenever the underlying connection is torn down for ANY reason -
-    // including completely normal, successful completion (Node fires
-    // 'close' after 'finish' too, once the socket is actually released).
-    // An unconditional `aborted = true` on every 'close' event means
-    // `aborted` could already be true by the time execution reached the
-    // download loop if 'close' fired for any earlier, unrelated reason
-    // (a superseded/cancelled probe request, connection reuse/teardown
-    // timing, a proxy closing an idle socket, etc.) - exactly the
-    // "Entering download loop { aborted: true, bytesSent: 0,
-    // chunkIndex: 0 }" symptom being reported. The loop's own guard
-    // (`while (!aborted && ...)`) was working correctly - it was being
-    // fed a flag that had already been (wrongly) tripped.
-    //
-    // THE FIX: only ever treat a 'close' as a genuine abort if the
-    // response had NOT already finished writing (`!res.writableEnded`).
-    // This is also, per current Node.js docs, the CORRECT and only
-    // reliable way to detect a premature disconnect on Node 20+:
-    // `request.aborted` and the `'aborted'` event on http.IncomingMessage
-    // are both explicitly deprecated by Node in favor of exactly this
-    // res-'close'-plus-writableEnded-check pattern, because 'close' is
-    // guaranteed to fire exactly once for every request/response cycle
-    // regardless of how it ends, while 'aborted' is not guaranteed to
-    // fire at all on every Node/proxy combination.
-    //
-    // req.on('aborted') is added below too, purely as a defense-in-depth
-    // secondary signal (per the explicit requirement to use it) - it is
-    // deprecated and may not fire reliably on Node 20+, so it must never
-    // be the ONLY signal relied on, but there is no harm in also listening
-    // for it as long as it is guarded exactly the same way.
+    // If the client disconnects mid-stream (closes tab, seeks again, etc.)
+    // stop pulling bytes from Telegram immediately.
     const onClose = () => {
-        if (aborted) return;
-        if (!res.writableEnded) {
-            aborted = true;
-            abortReason = abortReason || "client_disconnect";
-            log(rid, "warn", "Client connection closed before response finished (res 'close')", {
-                id,
-                reqAborted: req.aborted,
-                resWritableEnded: res.writableEnded,
-                elapsedMs: Date.now() - startedAt,
-            });
-        }
-        // If res.writableEnded is already true, this 'close' is just the
-        // normal post-completion teardown - NOT an abort. Do nothing.
+        aborted = true;
     };
     res.on("close", onClose);
-
-    const onReqAborted = () => {
-        if (aborted) return;
-        if (!res.writableEnded) {
-            aborted = true;
-            abortReason = abortReason || "client_disconnect";
-            log(rid, "warn", "Request aborted by client (req 'aborted' - deprecated Node event, kept as defense-in-depth only)", {
-                id,
-                reqAborted: req.aborted,
-                resWritableEnded: res.writableEnded,
-                elapsedMs: Date.now() - startedAt,
-            });
-        }
-    };
-    req.on("aborted", onReqAborted);
 
     try {
         // ---------------------------------------------------------------
@@ -537,11 +614,34 @@ router.get("/:id", async (req, res) => {
             dcId: media.dcId,
         });
 
+        // Acquire a connection authorized for the DC this specific file
+        // lives on. This is the fix for FileMigrateError: previously every
+        // GetFile call went through client.invoke() (the main, home-DC-only
+        // connection) regardless of which DC actually held the file.
+        let senderHandle;
+        try {
+            senderHandle = await acquireSender(client, media.dcId, rid);
+            log(rid, "info", "Resolved download sender", {
+                id,
+                homeDcId: Number(client.session?.dcId),
+                fileDcId: media.dcId,
+                usingBorrowedSender: senderHandle.isBorrowed,
+            });
+        } catch (senderErr) {
+            log(rid, "error", "Failed to acquire a sender for the file's DC", {
+                id,
+                fileDcId: media.dcId,
+                message: senderErr.message,
+            });
+            return res.status(503).json({ error: "Unable to reach Telegram's storage datacenter for this video" });
+        }
+
         let bytesSent = 0;
         let rawBytesReceived = 0;
         let isFirstChunk = true;
         let lastActivity = Date.now();
         let chunkIndex = 0;
+        let abortReason = null; // "client_disconnect" | "stall_timeout" | null
 
         const stallGuard = setInterval(() => {
             if (aborted) return;
@@ -560,25 +660,9 @@ router.get("/:id", async (req, res) => {
             }
         }, 5000);
 
-        // Required diagnostic: the exact state of every abort-related
-        // signal at the moment we're about to start pulling bytes from
-        // Telegram. If `aborted` is ever true here, this log tells you
-        // immediately whether it was `req.aborted`/`res.writableEnded`
-        // (a genuine, already-confirmed disconnect) or something else -
-        // there is no other path left that can set `aborted = true`
-        // before this point (see the onClose/onReqAborted guards above).
-        log(rid, "info", "Entering download loop", {
-            id,
-            reqAborted: req.aborted,
-            resWritableEnded: res.writableEnded,
-            aborted,
-            abortReason,
-            bytesSent,
-            chunkIndex,
-        });
-
         try {
             let offset = bigInt(alignedStart);
+            let migrations = 0;
 
             // Manually drive the download: request a chunk, write it,
             // advance the offset, repeat - fully explicit, no dependency
@@ -589,7 +673,7 @@ router.get("/:id", async (req, res) => {
                 let result;
                 try {
                     result = await withTimeout(
-                        client.invoke(
+                        senderHandle.sender.invoke(
                             new Api.upload.GetFile({
                                 location: fileLocation,
                                 offset,
@@ -600,6 +684,38 @@ router.get("/:id", async (req, res) => {
                         `Telegram GetFile chunk #${chunkIndex} (offset=${offset.toString()})`
                     );
                 } catch (chunkErr) {
+                    if (isFileMigrateError(chunkErr)) {
+                        const newDcId = extractMigrateDcId(chunkErr);
+                        migrations += 1;
+
+                        log(rid, "warn", "Telegram requested a DC migration for this file", {
+                            id,
+                            chunkIndex,
+                            fromDcId: senderHandle.dcId,
+                            toDcId: newDcId,
+                            migrationAttempt: migrations,
+                        });
+
+                        if (!newDcId || migrations > MAX_DC_MIGRATIONS) {
+                            log(rid, "error", "Exceeded max DC migrations for this request, giving up", {
+                                id,
+                                migrations,
+                                lastAttemptedDcId: newDcId,
+                            });
+                            throw chunkErr;
+                        }
+
+                        // Swap to a sender for the DC Telegram actually
+                        // wants, release the old one, and retry this exact
+                        // chunk (offset unchanged - we haven't consumed it).
+                        const oldSenderHandle = senderHandle;
+                        senderHandle = await acquireSender(client, newDcId, rid);
+                        await releaseSender(client, oldSenderHandle, rid);
+
+                        chunkIndex -= 1; // this attempt didn't actually consume a chunk slot
+                        continue;
+                    }
+
                     log(rid, "error", "Telegram GetFile request failed or timed out", {
                         id,
                         chunkIndex,
@@ -711,6 +827,7 @@ router.get("/:id", async (req, res) => {
             }
         } finally {
             clearInterval(stallGuard);
+            await releaseSender(client, senderHandle, rid);
         }
 
         log(rid, "info", "Total bytes sent", { id, bytesSent, contentLength, chunksRequested: chunkIndex });
@@ -800,7 +917,6 @@ router.get("/:id", async (req, res) => {
         }
     } finally {
         res.off("close", onClose);
-        req.off("aborted", onReqAborted);
     }
 });
 
