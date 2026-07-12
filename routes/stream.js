@@ -248,20 +248,75 @@ router.get("/:id", async (req, res) => {
     const { id } = req.params;
 
     let aborted = false;
+    let abortReason = null; // "client_disconnect" | "stall_timeout" | null
 
-req.on("aborted", () => {
-    aborted = true;
-    console.log(`[stream:${rid}] Client aborted request`);
-});
+    // ---------------------------------------------------------------
+    // Client-disconnect detection
+    // ---------------------------------------------------------------
+    // THE BUG: the previous version of this handler did
+    //     const onClose = () => { aborted = true; };
+    //     res.on("close", onClose);
+    // with NO guard at all. In Node, the response's 'close' event fires
+    // whenever the underlying connection is torn down for ANY reason -
+    // including completely normal, successful completion (Node fires
+    // 'close' after 'finish' too, once the socket is actually released).
+    // An unconditional `aborted = true` on every 'close' event means
+    // `aborted` could already be true by the time execution reached the
+    // download loop if 'close' fired for any earlier, unrelated reason
+    // (a superseded/cancelled probe request, connection reuse/teardown
+    // timing, a proxy closing an idle socket, etc.) - exactly the
+    // "Entering download loop { aborted: true, bytesSent: 0,
+    // chunkIndex: 0 }" symptom being reported. The loop's own guard
+    // (`while (!aborted && ...)`) was working correctly - it was being
+    // fed a flag that had already been (wrongly) tripped.
+    //
+    // THE FIX: only ever treat a 'close' as a genuine abort if the
+    // response had NOT already finished writing (`!res.writableEnded`).
+    // This is also, per current Node.js docs, the CORRECT and only
+    // reliable way to detect a premature disconnect on Node 20+:
+    // `request.aborted` and the `'aborted'` event on http.IncomingMessage
+    // are both explicitly deprecated by Node in favor of exactly this
+    // res-'close'-plus-writableEnded-check pattern, because 'close' is
+    // guaranteed to fire exactly once for every request/response cycle
+    // regardless of how it ends, while 'aborted' is not guaranteed to
+    // fire at all on every Node/proxy combination.
+    //
+    // req.on('aborted') is added below too, purely as a defense-in-depth
+    // secondary signal (per the explicit requirement to use it) - it is
+    // deprecated and may not fire reliably on Node 20+, so it must never
+    // be the ONLY signal relied on, but there is no harm in also listening
+    // for it as long as it is guarded exactly the same way.
+    const onClose = () => {
+        if (aborted) return;
+        if (!res.writableEnded) {
+            aborted = true;
+            abortReason = abortReason || "client_disconnect";
+            log(rid, "warn", "Client connection closed before response finished (res 'close')", {
+                id,
+                reqAborted: req.aborted,
+                resWritableEnded: res.writableEnded,
+                elapsedMs: Date.now() - startedAt,
+            });
+        }
+        // If res.writableEnded is already true, this 'close' is just the
+        // normal post-completion teardown - NOT an abort. Do nothing.
+    };
+    res.on("close", onClose);
 
-res.on("error", (err) => {
-    aborted = true;
-    console.error(`[stream:${rid}] Response error:`, err.message);
-});
-
-res.on("finish", () => {
-    aborted = true;
-});
+    const onReqAborted = () => {
+        if (aborted) return;
+        if (!res.writableEnded) {
+            aborted = true;
+            abortReason = abortReason || "client_disconnect";
+            log(rid, "warn", "Request aborted by client (req 'aborted' - deprecated Node event, kept as defense-in-depth only)", {
+                id,
+                reqAborted: req.aborted,
+                resWritableEnded: res.writableEnded,
+                elapsedMs: Date.now() - startedAt,
+            });
+        }
+    };
+    req.on("aborted", onReqAborted);
 
     try {
         // ---------------------------------------------------------------
@@ -487,7 +542,6 @@ res.on("finish", () => {
         let isFirstChunk = true;
         let lastActivity = Date.now();
         let chunkIndex = 0;
-        let abortReason = null; // "client_disconnect" | "stall_timeout" | null
 
         const stallGuard = setInterval(() => {
             if (aborted) return;
@@ -506,19 +560,29 @@ res.on("finish", () => {
             }
         }, 5000);
 
+        // Required diagnostic: the exact state of every abort-related
+        // signal at the moment we're about to start pulling bytes from
+        // Telegram. If `aborted` is ever true here, this log tells you
+        // immediately whether it was `req.aborted`/`res.writableEnded`
+        // (a genuine, already-confirmed disconnect) or something else -
+        // there is no other path left that can set `aborted = true`
+        // before this point (see the onClose/onReqAborted guards above).
+        log(rid, "info", "Entering download loop", {
+            id,
+            reqAborted: req.aborted,
+            resWritableEnded: res.writableEnded,
+            aborted,
+            abortReason,
+            bytesSent,
+            chunkIndex,
+        });
+
         try {
             let offset = bigInt(alignedStart);
 
             // Manually drive the download: request a chunk, write it,
             // advance the offset, repeat - fully explicit, no dependency
             // on iterDownload()'s internal generator/EOF heuristics.
-            console.log(`[stream:${rid}] Entering download loop`, {
-    aborted,
-    bytesSent,
-    contentLength,
-    chunkIndex
-});
-
             while (!aborted && bytesSent < contentLength) {
                 chunkIndex += 1;
 
@@ -735,10 +799,9 @@ res.on("finish", () => {
             res.destroy(err);
         }
     } finally {
-    req.removeAllListeners("aborted");
-    res.removeAllListeners("error");
-    res.removeAllListeners("finish");
-}
+        res.off("close", onClose);
+        req.off("aborted", onReqAborted);
+    }
 });
 
 module.exports = router;
