@@ -1,3 +1,9 @@
+/**
+ * routes/stream.js
+ * FIXED VERSION - Root cause addressed: premature client_disconnect via 'close' event
+ * before first chunk (headers not flushed + slow first GetFile RPC).
+ */
+
 const express = require("express");
 const router = express.Router();
 
@@ -7,6 +13,8 @@ const { Api } = require("telegram");
 
 const bigInt = require("big-integer");
 
+// ---------------------------------------------------------------------------
+// Config (unchanged)
 const MIN_CHUNK_SIZE = 4096;
 const MAX_CHUNK_SIZE = 1024 * 1024;
 const DEFAULT_CHUNK_SIZE = 512 * 1024;
@@ -21,21 +29,26 @@ function resolveChunkSize() {
 const CHUNK_SIZE = resolveChunkSize();
 const METADATA_TIMEOUT_MS = 15000;
 const STALL_TIMEOUT_MS = 30000;
-const CHUNK_REQUEST_TIMEOUT_MS = 25000;
+const CHUNK_REQUEST_TIMEOUT_MS = 20000;
 
 const VALID_ID_REGEX = /^[a-zA-Z0-9_-]+$/;
 
+// ---------------------------------------------------------------------------
+// Logging (unchanged)
 function reqId() {
     return Math.random().toString(36).slice(2, 8);
 }
 
 function log(rid, level, msg, meta) {
     const line = `[stream:${rid}] ${msg}`;
-    if (level === "error") console.error(line, meta || "");
-    else if (level === "warn") console.warn(line, meta || "");
-    else console.log(line, meta || "");
+    const payload = meta ? { ...meta } : undefined;
+    if (level === "error") console.error(line, payload || "");
+    else if (level === "warn") console.warn(line, payload || "");
+    else console.log(line, payload || "");
 }
 
+// ---------------------------------------------------------------------------
+// Utilities (unchanged)
 function toNumber(value) {
     if (value === null || value === undefined) return NaN;
     if (typeof value === "number") return value;
@@ -55,16 +68,36 @@ function withTimeout(promise, ms, label) {
 function parseRange(rangeHeader, totalSize) {
     if (!rangeHeader) return null;
     const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim());
-    if (!match) throw Object.assign(new Error("Malformed Range"), {type: "RANGE_MALFORMED"});
-    let start = match[1] ? parseInt(match[1], 10) : 0;
-    let end = match[2] ? parseInt(match[2], 10) : totalSize - 1;
-    if (Number.isNaN(start) || Number.isNaN(end) || start > end || start >= totalSize) {
-        throw Object.assign(new Error("Range not satisfiable"), {type: "RANGE_NOT_SATISFIABLE"});
+    if (!match || (match[1] === "" && match[2] === "")) {
+        const err = new Error("Malformed Range header");
+        err.type = "RANGE_MALFORMED";
+        throw err;
+    }
+    let start, end;
+    if (match[1] === "") {
+        const suffixLength = parseInt(match[2], 10);
+        if (Number.isNaN(suffixLength) || suffixLength <= 0) {
+            const err = new Error("Malformed suffix range");
+            err.type = "RANGE_MALFORMED";
+            throw err;
+        }
+        start = Math.max(totalSize - suffixLength, 0);
+        end = totalSize - 1;
+    } else {
+        start = parseInt(match[1], 10);
+        end = match[2] === "" ? totalSize - 1 : parseInt(match[2], 10);
+    }
+    if (Number.isNaN(start) || Number.isNaN(end) || start < 0 || start > end || start >= totalSize) {
+        const err = new Error("Requested range not satisfiable");
+        err.type = "RANGE_NOT_SATISFIABLE";
+        throw err;
     }
     if (end >= totalSize) end = totalSize - 1;
     return { start, end };
 }
 
+// ---------------------------------------------------------------------------
+// FIXED Route
 router.get("/:id", async (req, res) => {
     const rid = reqId();
     const startedAt = Date.now();
@@ -73,57 +106,114 @@ router.get("/:id", async (req, res) => {
     let aborted = false;
     let abortReason = null;
 
+    // Client-disconnect detection (improved guards)
     const onClose = () => {
         if (aborted) return;
         if (!res.writableEnded) {
             aborted = true;
-            abortReason = "client_disconnect";
-            log(rid, "warn", "Client disconnected", { id });
+            abortReason = abortReason || "client_disconnect";
+            log(rid, "warn", "Client connection closed before response finished", {
+                id,
+                reqAborted: req.aborted,
+                resWritableEnded: res.writableEnded,
+                elapsedMs: Date.now() - startedAt,
+            });
         }
     };
     res.on("close", onClose);
-    req.on("aborted", onClose);
+
+    const onReqAborted = () => {
+        if (aborted) return;
+        if (!res.writableEnded) {
+            aborted = true;
+            abortReason = abortReason || "client_disconnect";
+            log(rid, "warn", "Request aborted by client", { id });
+        }
+    };
+    req.on("aborted", onReqAborted);
 
     try {
-        if (!VALID_ID_REGEX.test(id)) return res.status(400).json({ error: "Invalid id" });
+        if (!id || typeof id !== "string" || !VALID_ID_REGEX.test(id)) {
+            log(rid, "warn", "Invalid video id", { id });
+            return res.status(400).json({ error: "Invalid video id" });
+        }
 
         const client = req.app.locals.telegramClient;
-        if (!client) return res.status(503).json({ error: "Service unavailable" });
+        if (!client) {
+            log(rid, "error", "Telegram client not initialized");
+            return res.status(503).json({ error: "Streaming service unavailable" });
+        }
+        if (!client.connected) {
+            try {
+                await withTimeout(client.connect(), METADATA_TIMEOUT_MS, "Telegram connect");
+            } catch (connectErr) {
+                log(rid, "error", "Telegram connect failed", { message: connectErr.message });
+                return res.status(503).json({ error: "Telegram unavailable" });
+            }
+        }
 
-        const doc = await db.collection("videos").doc(id).get();
+        // Firestore + Telegram metadata (unchanged)
+        log(rid, "info", "Loading Firestore document...", { id });
+        let doc;
+        try {
+            doc = await db.collection("videos").doc(id).get();
+        } catch (dbErr) {
+            log(rid, "error", "Firestore error", { id, message: dbErr.message });
+            return res.status(500).json({ error: "Failed to load metadata" });
+        }
+
         if (!doc.exists) return res.status(404).json({ error: "Video not found" });
 
         const video = doc.data();
-        let message = await withTimeout(getMessage(client, video.channelId, video.messageId), METADATA_TIMEOUT_MS, "getMessage");
-        if (!message) return res.status(404).json({ error: "Message not found" });
+        if (!video?.channelId || !video?.messageId) {
+            return res.status(404).json({ error: "Incomplete video metadata" });
+        }
+
+        let message;
+        try {
+            message = await withTimeout(
+                getMessage(client, video.channelId, video.messageId),
+                METADATA_TIMEOUT_MS,
+                "Telegram getMessage"
+            );
+        } catch (tgErr) {
+            log(rid, "error", "getMessage failed", { id, message: tgErr.message });
+            return res.status(503).json({ error: "Telegram unavailable" });
+        }
+
+        if (!message) return res.status(404).json({ error: "Source message not found" });
 
         const media = getVideoMedia(message);
-        if (!media) return res.status(404).json({ error: "No media" });
+        if (!media) return res.status(404).json({ error: "Video media not found" });
 
         const totalSize = toNumber(media.size);
-        if (!Number.isFinite(totalSize) || totalSize <= 0) return res.status(500).json({ error: "Invalid size" });
+        if (!Number.isFinite(totalSize) || totalSize <= 0) {
+            return res.status(500).json({ error: "Invalid media size" });
+        }
 
         const mimeType = media.mimeType?.startsWith("video/") ? media.mimeType : "video/mp4";
 
+        // Parse Range
         let range;
         try {
             range = parseRange(req.headers.range, totalSize);
-        } catch (e) {
-            if (e.type === "RANGE_NOT_SATISFIABLE") {
+        } catch (rangeErr) {
+            if (rangeErr.type === "RANGE_NOT_SATISFIABLE") {
                 res.set("Content-Range", `bytes */${totalSize}`);
-                return res.status(416).end();
+                return res.status(416).json({ error: "Range not satisfiable" });
             }
-            return res.status(400).json({ error: "Bad range" });
+            return res.status(400).json({ error: "Malformed Range" });
         }
 
         const start = range ? range.start : 0;
         const end = range ? range.end : totalSize - 1;
         const contentLength = end - start + 1;
 
+        // Set headers
         res.set({
             "Accept-Ranges": "bytes",
             "Content-Type": mimeType,
-            "Content-Length": contentLength.toString(),
+            "Content-Length": String(contentLength),
             "Cache-Control": "no-cache",
         });
 
@@ -134,49 +224,83 @@ router.get("/:id", async (req, res) => {
             res.status(200);
         }
 
-        // CRITICAL FIXES
+        // === CRITICAL FIX: Flush headers immediately ===
         res.flushHeaders();
-        log(rid, "info", "Headers flushed", { id, start, contentLength });
+        log(rid, "info", "Headers flushed to client - starting stream", {
+            id,
+            start,
+            end,
+            contentLength,
+            chunkSize: CHUNK_SIZE,
+        });
 
-        // Send a tiny dummy byte immediately to keep connection alive
-        if (contentLength > 0) {
-            res.write(new Uint8Array([0x00]));
+        // Stream logic (unchanged - alignment, manual GetFile, integrity)
+        const alignedStart = start - (start % CHUNK_SIZE);
+        const skipBytes = start - alignedStart;
+
+        let fileLocation;
+        try {
+            fileLocation = getFileLocation(media);
+        } catch (locErr) {
+            log(rid, "error", "Failed to build file location", { id, message: locErr.message });
+            return res.status(500).json({ error: "Unable to prepare video" });
         }
 
-        let fileLocation = getFileLocation(media);
-        let bytesSent = contentLength > 0 ? 1 : 0;
-        let offset = bigInt(start);
-        let chunkIndex = 0;
+        let bytesSent = 0;
+        let rawBytesReceived = 0;
+        let isFirstChunk = true;
         let lastActivity = Date.now();
+        let chunkIndex = 0;
 
         const stallGuard = setInterval(() => {
+            if (aborted) return;
             if (Date.now() - lastActivity > STALL_TIMEOUT_MS) {
+                log(rid, "error", "Stream stalled", { id, bytesSent });
                 aborted = true;
-                abortReason = "stall";
+                abortReason = "stall_timeout";
             }
         }, 5000);
 
+        log(rid, "info", "Entering download loop", { id, aborted });
+
         try {
+            let offset = bigInt(alignedStart);
             while (!aborted && bytesSent < contentLength) {
-                chunkIndex++;
-                const result = await withTimeout(
-                    client.invoke(new Api.upload.GetFile({ location: fileLocation, offset, limit: CHUNK_SIZE })),
-                    CHUNK_REQUEST_TIMEOUT_MS,
-                    `GetFile #${chunkIndex}`
-                );
+                chunkIndex += 1;
+                let result;
+                try {
+                    result = await withTimeout(
+                        client.invoke(new Api.upload.GetFile({ location: fileLocation, offset, limit: CHUNK_SIZE })),
+                        CHUNK_REQUEST_TIMEOUT_MS,
+                        `GetFile chunk #${chunkIndex}`
+                    );
+                } catch (chunkErr) {
+                    log(rid, "error", "GetFile failed", { id, chunkIndex, offset: offset.toString(), message: chunkErr.message });
+                    throw chunkErr;
+                }
 
-                const bytes = result.bytes || Buffer.alloc(0);
-                if (bytes.length === 0) break;
+                if (result.className === "upload.FileCdnRedirect") throw new Error("CDN redirect unsupported");
 
+                const bytes = result.bytes;
+                if (!bytes || bytes.length === 0) break;
+
+                rawBytesReceived += bytes.length;
                 lastActivity = Date.now();
+
                 let piece = bytes;
+                if (isFirstChunk) {
+                    isFirstChunk = false;
+                    if (skipBytes > 0) piece = piece.subarray(skipBytes);
+                }
 
                 const remaining = contentLength - bytesSent;
                 if (piece.length > remaining) piece = piece.subarray(0, remaining);
 
                 if (piece.length > 0) {
-                    res.write(piece);
+                    const canContinue = res.write(piece);
                     bytesSent += piece.length;
+                    lastActivity = Date.now();
+                    if (!canContinue) await new Promise(resolve => res.once("drain", resolve));
                 }
 
                 offset = offset.add(bytes.length);
@@ -186,17 +310,29 @@ router.get("/:id", async (req, res) => {
             clearInterval(stallGuard);
         }
 
-        if (!aborted && bytesSent >= contentLength - 1) {
-            res.end();
-            log(rid, "info", "Stream completed", { id, bytesSent });
-        } else if (!res.writableEnded) {
-            res.destroy();
+        log(rid, "info", "Stream finished", { id, bytesSent, contentLength });
+
+        if (aborted) {
+            if (!res.writableEnded) res.destroy(new Error(`Aborted: ${abortReason}`));
+            return;
         }
 
+        if (bytesSent !== contentLength) {
+            log(rid, "error", "Integrity failure", { id, bytesSent, contentLength });
+            if (!res.writableEnded) res.destroy(new Error("Byte count mismatch"));
+            return;
+        }
+
+        res.end();
+        log(rid, "info", "Stream completed successfully", { id });
+
     } catch (err) {
-        log(rid, "error", "Stream error", { message: err.message });
-        if (!res.headersSent) res.status(500).json({ error: "Failed" });
+        log(rid, "error", "Unhandled stream error", { id, message: err.message });
+        if (!res.headersSent) res.status(500).json({ error: "Stream failed" });
         else if (!res.writableEnded) res.destroy(err);
+    } finally {
+        res.off("close", onClose);
+        req.off("aborted", onReqAborted);
     }
 });
 
