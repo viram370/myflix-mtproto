@@ -132,6 +132,19 @@ const METADATA_TIMEOUT_MS = 15000;
 // we assume the Telegram connection has stalled and abort cleanly.
 const STALL_TIMEOUT_MS = 30000;
 
+// How long we wait specifically for the FIRST chunk from iterDownload()
+// before giving up. This is intentionally shorter than STALL_TIMEOUT_MS:
+// a hang on the very first chunk almost always means the sender for this
+// document's DC never finished connecting/exporting (DC migration stall)
+// or is unreachable (blocked egress to that DC's IP), not a transient
+// mid-stream slowdown - so there's no reason to make the browser wait a
+// full 30s (by which point it will likely have already given up and
+// disconnected on its own, which is indistinguishable in logs from a
+// genuine client-side abort). Failing fast here also means we can still
+// send a clean error response, since Express won't have flushed any
+// headers yet at this point (nothing has been written to `res`).
+const FIRST_CHUNK_TIMEOUT_MS = 12000;
+
 // How many leading bytes of the very first chunk actually written to the
 // response we log (hex), so a truncated/misaligned stream shows up
 // immediately in logs instead of only surfacing as a vague player error.
@@ -591,6 +604,23 @@ router.get("/:id", async (req, res) => {
             dcId: media.dcId,
         });
 
+        // Diagnostic: surface whether this document actually lives on a
+        // different DC than the one the client's main connection is on.
+        // iterDownload() is supposed to transparently export/borrow a
+        // sender for `dcId` when they differ, but if that export hangs
+        // (auth-key exchange stall) or the DC's IP is unreachable from
+        // this container's network egress, iterDownload() will simply
+        // never yield a first chunk - with no error, no throw, just
+        // silence, which is indistinguishable from any other kind of hang
+        // unless we log the DCs involved up front.
+        const clientMainDcId = client.session?.dcId ?? client._dcId ?? "unknown";
+        log(rid, "info", "DC check before download", {
+            id,
+            fileDcId: media.dcId,
+            clientMainDcId,
+            crossDc: clientMainDcId !== "unknown" && clientMainDcId !== media.dcId,
+        });
+
         downloadIterator = client.iterDownload({
             file: fileLocation,
             offset: bigInt(alignedStart),
@@ -634,12 +664,79 @@ router.get("/:id", async (req, res) => {
             }
         }, 5000);
 
+        log(rid, "info", "Awaiting first chunk from Telegram iterDownload()...", {
+            id,
+            offset: alignedStart,
+            requestSize: CHUNK_SIZE,
+            limit: chunkLimit,
+            dcId: media.dcId,
+            firstChunkTimeoutMs: FIRST_CHUNK_TIMEOUT_MS,
+        });
+
+        // Manual iterator consumption (instead of `for await...of`) so we
+        // can wrap ONLY the very first `.next()` call in its own bounded
+        // timeout. A hang on the first chunk means Telegram never even
+        // began answering (see the DC-check log above); a hang mid-stream
+        // is covered separately by the STALL_TIMEOUT_MS watchdog below.
+        const asyncIterator =
+            typeof downloadIterator[Symbol.asyncIterator] === "function"
+                ? downloadIterator[Symbol.asyncIterator]()
+                : downloadIterator;
+
+        let isFirstNext = true;
+        let firstChunkTimedOut = false;
+
         try {
-            for await (const chunk of downloadIterator) {
+            while (true) {
+                if (aborted) break;
+
+                let result;
+                if (isFirstNext) {
+                    isFirstNext = false;
+                    try {
+                        result = await withTimeout(
+                            asyncIterator.next(),
+                            FIRST_CHUNK_TIMEOUT_MS,
+                            "Telegram iterDownload() first chunk"
+                        );
+                    } catch (firstChunkErr) {
+                        firstChunkTimedOut = true;
+                        abortReason = "no_first_chunk";
+                        log(rid, "error", "No chunk received from Telegram within timeout - iterDownload() never yielded. Likely a DC migration/sender export stall, an unreachable DC IP from this container's egress, or an invalid file location", {
+                            id,
+                            fileDcId: media.dcId,
+                            clientMainDcId: client.session?.dcId ?? client._dcId ?? "unknown",
+                            offset: alignedStart,
+                            requestSize: CHUNK_SIZE,
+                            limit: chunkLimit,
+                            timeoutMs: FIRST_CHUNK_TIMEOUT_MS,
+                            message: firstChunkErr.message,
+                        });
+                        aborted = true;
+                        if (typeof downloadIterator.return === "function") {
+                            downloadIterator.return().catch(() => {});
+                        }
+                        break;
+                    }
+                } else {
+                    result = await asyncIterator.next();
+                }
+
+                if (result.done) break;
+
+                const chunk = result.value;
+
                 if (aborted) break;
 
                 chunkIndex += 1;
                 rawBytesReceived += chunk.length;
+
+                log(rid, "info", "Received Telegram chunk", {
+                    id,
+                    chunkIndex,
+                    chunkLength: chunk.length,
+                    rawBytesReceived,
+                });
 
                 // A chunk shorter than requestSize before we've actually
                 // reached the end of our requested window means Telegram
@@ -759,6 +856,22 @@ router.get("/:id", async (req, res) => {
             }
         } finally {
             clearInterval(stallGuard);
+        }
+
+        if (firstChunkTimedOut) {
+            if (!res.headersSent) {
+                // Nothing has been written yet, so we can still respond
+                // with a clean error instead of leaving the client to
+                // time out and disconnect on its own (which is what
+                // produced the ambiguous "client_disconnected" abort
+                // reason previously - the real cause was always this).
+                return res.status(503).json({
+                    error: "Telegram did not return video data in time. Please try again.",
+                });
+            }
+            // Headers were already flushed somehow - fall through to the
+            // normal aborted/integrity-check handling below, which will
+            // correctly destroy the connection since bytesSent is 0.
         }
 
         log(rid, "info", "Bytes written", { id, bytesSent, contentLength });
