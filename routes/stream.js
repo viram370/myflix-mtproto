@@ -249,12 +249,19 @@ router.get("/:id", async (req, res) => {
 
     let aborted = false;
 
-    // If the client disconnects mid-stream (closes tab, seeks again, etc.)
-    // stop pulling bytes from Telegram immediately.
-    const onClose = () => {
-        aborted = true;
-    };
-    res.on("close", onClose);
+req.on("aborted", () => {
+    aborted = true;
+    console.log(`[stream:${rid}] Client aborted request`);
+});
+
+res.on("error", (err) => {
+    aborted = true;
+    console.error(`[stream:${rid}] Response error:`, err.message);
+});
+
+res.on("finish", () => {
+    aborted = true;
+});
 
     try {
         // ---------------------------------------------------------------
@@ -505,6 +512,13 @@ router.get("/:id", async (req, res) => {
             // Manually drive the download: request a chunk, write it,
             // advance the offset, repeat - fully explicit, no dependency
             // on iterDownload()'s internal generator/EOF heuristics.
+            console.log(`[stream:${rid}] Entering download loop`, {
+    aborted,
+    bytesSent,
+    contentLength,
+    chunkIndex
+});
+
             while (!aborted && bytesSent < contentLength) {
                 chunkIndex += 1;
 
@@ -721,8 +735,10 @@ router.get("/:id", async (req, res) => {
             res.destroy(err);
         }
     } finally {
-        res.off("close", onClose);
-    }
+    req.removeAllListeners("aborted");
+    res.removeAllListeners("error");
+    res.removeAllListeners("finish");
+}
 });
 
 module.exports = router;
