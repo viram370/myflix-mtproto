@@ -1,59 +1,12 @@
-/**
- * utils/telegram.js
- *
- * Robust Telegram (GramJS / MTProto) message + media resolution helpers.
- *
- * Root cause of the previous "Could not play video" / "Source message not
- * found" bug: getMessage() called client.getEntity(channelId) with no
- * entity/InputPeer caching and no fallback path. MTProto channels require an
- * access_hash to build a valid InputPeerChannel/InputChannel; GramJS only
- * knows that access_hash if the entity has already been seen in this
- * session (e.g. via a prior getDialogs() call). A "cold" session that has
- * never listed its dialogs will fail to resolve a channel purely from a
- * numeric ID, even though the channel and message both genuinely exist.
- * On top of that, the file had a duplicated/nested function body that put a
- * `module.exports = {...}` assignment *inside* getMessage's function body,
- * so the real exported getMessage was a broken, effectively-no-op shadow
- * function that always returned undefined.
- *
- * This file fixes both issues:
- *  1. Normalizes channelId (handles -100xxxxxxxxxx marked IDs, bare
- *     positive channel IDs, and @usernames).
- *  2. Resolves + caches InputPeer entities, and if the entity is not yet
- *     known to the session, forces a dialog sync (which populates GramJS's
- *     entity cache with access hashes) and retries automatically.
- *  3. Retries transient Telegram/RPC failures (including FLOOD_WAIT) with
- *     backoff, and only ever returns `null` when the message truly does
- *     not exist. Genuine connectivity / resolution failures are thrown so
- *     callers (routes/stream.js) can correctly report "unavailable" rather
- *     than incorrectly reporting "not found".
- *  4. Detects video media on both Api.Document (video attribute) and
- *     video/* mime-typed documents, including forwarded messages, and
- *     refuses to hand back a document with a missing/invalid size (which
- *     would otherwise silently break the byte-range math downstream in
- *     routes/stream.js and produce a corrupted, unplayable response).
- */
-
 const { Api } = require("telegram");
-
-// ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
 
 const MAX_MESSAGE_ATTEMPTS = 4;
 const BASE_RETRY_DELAY_MS = 800;
-const DIALOG_SYNC_COOLDOWN_MS = 30 * 1000; // don't hammer Telegram on repeated misses
+const DIALOG_SYNC_COOLDOWN_MS = 30 * 1000;
 const DIALOG_SYNC_LIMIT = 300;
 
-// ---------------------------------------------------------------------------
-// Entity / InputPeer cache
-// ---------------------------------------------------------------------------
-
-// normalizedChannelId -> resolved InputPeer
 const peerCache = new Map();
 
-// Timestamp of the last forced dialog sync, so concurrent/rapid misses don't
-// each trigger their own full getDialogs() call.
 let lastDialogSyncAt = 0;
 let dialogSyncInFlight = null;
 
@@ -61,25 +14,13 @@ function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/**
- * Extract a stable, human-readable Telegram/RPC error code such as
- * CHANNEL_INVALID, CHAT_ID_INVALID, MESSAGE_ID_INVALID, PEER_ID_INVALID,
- * or FLOOD_WAIT_X. Falls back to the generic error message.
- */
 function describeError(err) {
     if (!err) return "Unknown error";
-    if (err.errorMessage) return err.errorMessage; // GramJS RPCError code, e.g. CHANNEL_INVALID
+    if (err.errorMessage) return err.errorMessage;
     if (err.code && err.message) return `${err.code}: ${err.message}`;
     return err.message || String(err);
 }
 
-/**
- * Normalize a Firestore-stored channelId into the form GramJS expects.
- * Accepts:
- *   -1001234567890   (Bot-API "marked" channel id, number or string)
- *   1234567890        (bare positive channel id)
- *   "@somechannel"     (public username)
- */
 function normalizeChannelId(channelId) {
     if (typeof channelId === "string" && channelId.trim().startsWith("@")) {
         return channelId.trim();
@@ -88,24 +29,16 @@ function normalizeChannelId(channelId) {
     const idStr = String(channelId).trim();
 
     if (idStr.startsWith("-100")) {
-        // Already in marked form, GramJS understands this directly.
         return idStr;
     }
 
     if (idStr.startsWith("-")) {
-        // Some other negative form (e.g. basic group) - use as-is.
         return idStr;
     }
 
-    // Bare positive channel id -> convert to the standard marked form.
     return `-100${idStr}`;
 }
 
-/**
- * Force a dialog listing so GramJS populates its session entity cache
- * (id -> access_hash) for every chat/channel/user this account can see.
- * This is the standard fix for "Could not find the input entity" errors.
- */
 async function syncDialogs(client, { force = false } = {}) {
     const now = Date.now();
 
@@ -113,7 +46,6 @@ async function syncDialogs(client, { force = false } = {}) {
         return;
     }
 
-    // Coalesce concurrent callers into a single in-flight sync.
     if (dialogSyncInFlight) {
         return dialogSyncInFlight;
     }
@@ -135,13 +67,6 @@ async function syncDialogs(client, { force = false } = {}) {
     return dialogSyncInFlight;
 }
 
-/**
- * Resolve a channelId into a usable InputPeer, using the cache first,
- * then falling back to a forced dialog sync + retry. Throws (does not
- * return null) if the channel genuinely cannot be resolved, so callers can
- * distinguish "Telegram unavailable / not resolvable" from "message not
- * found".
- */
 async function resolveChannel(client, channelId) {
     const key = normalizeChannelId(channelId);
 
@@ -152,8 +77,6 @@ async function resolveChannel(client, channelId) {
 
     console.log(`[telegram] Resolving channel... (raw=${channelId}, normalized=${key})`);
 
-    // Attempt 1: direct resolution (works if already in the session's
-    // entity cache, or if key is a public @username).
     try {
         const inputPeer = await client.getInputEntity(key);
         peerCache.set(key, inputPeer);
@@ -166,7 +89,6 @@ async function resolveChannel(client, channelId) {
         );
     }
 
-    // Attempt 2: force a dialog sync (loads access hashes) and retry.
     await syncDialogs(client, { force: true });
 
     try {
@@ -189,10 +111,6 @@ async function resolveChannel(client, channelId) {
     }
 }
 
-/**
- * Drop a cached peer, e.g. after a CHANNEL_INVALID / PEER_ID_INVALID
- * response, in case the access hash changed or the cache went stale.
- */
 function invalidateChannelCache(channelId) {
     const key = normalizeChannelId(channelId);
     peerCache.delete(key);
@@ -212,10 +130,6 @@ function isStaleEntityCode(detail) {
     return /CHANNEL_INVALID|PEER_ID_INVALID|CHAT_ID_INVALID/i.test(detail);
 }
 
-/**
- * Fetch a single message by id from an already-resolved peer, with retry +
- * backoff for transient failures (including FLOOD_WAIT).
- */
 async function fetchMessage(client, channelId, peer, messageId) {
     let lastErr = null;
 
@@ -228,8 +142,6 @@ async function fetchMessage(client, channelId, peer, messageId) {
             const messages = await client.getMessages(peer, { ids: [messageId] });
             const message = messages?.[0];
 
-            // GramJS returns an Api.MessageEmpty (or nothing) when the id is
-            // valid-shaped but the message truly doesn't exist / was deleted.
             if (!message || message.className === "MessageEmpty") {
                 console.warn(
                     `[telegram] Message ${messageId} does not exist in channel ${channelId} (deleted or never existed).`
@@ -247,8 +159,6 @@ async function fetchMessage(client, channelId, peer, messageId) {
             );
 
             if (isStaleEntityCode(detail)) {
-                // The cached peer is no longer valid - purge it so the next
-                // top-level getMessage() call re-resolves from scratch.
                 invalidateChannelCache(channelId);
                 const reErr = new Error(`TELEGRAM_RPC_ERROR: ${detail}`);
                 reErr.telegramCode = detail;
@@ -269,7 +179,6 @@ async function fetchMessage(client, channelId, peer, messageId) {
                 continue;
             }
 
-            // Non-retryable RPC error (MESSAGE_ID_INVALID, etc.) - surface it.
             const finalErr = new Error(`TELEGRAM_RPC_ERROR: ${detail}`);
             finalErr.telegramCode = detail;
             throw finalErr;
@@ -281,19 +190,6 @@ async function fetchMessage(client, channelId, peer, messageId) {
     throw err;
 }
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-/**
- * Get a message from a Telegram channel.
- *
- * Returns the Api.Message on success.
- * Returns null ONLY when the message genuinely does not exist (bad id,
- * deleted message, or MessageEmpty).
- * Throws when the channel/entity cannot be resolved or Telegram is
- * unavailable, so callers can distinguish "unavailable" from "not found".
- */
 async function getMessage(client, channelId, messageId) {
     if (!client) {
         throw new Error("TELEGRAM_CLIENT_MISSING: no Telegram client provided");
@@ -310,20 +206,11 @@ async function getMessage(client, channelId, messageId) {
         return null;
     }
 
-    // Resolve the peer; this throws (not returns null) on real failures.
     const peer = await resolveChannel(client, channelId);
 
-    // Fetch the message; this also throws on real failures, returns null
-    // only when the message truly does not exist.
     return fetchMessage(client, channelId, peer, numericMessageId);
 }
 
-/**
- * Best-effort conversion of a Document's `size` field (Number / BigInt /
- * big-integer instance) to a plain JS Number, purely for validation/logging
- * here. routes/stream.js does its own equivalent conversion for the actual
- * byte-range math.
- */
 function sizeToNumber(value) {
     if (value === null || value === undefined) return NaN;
     if (typeof value === "number") return value;
@@ -332,27 +219,6 @@ function sizeToNumber(value) {
     return Number(value.toString());
 }
 
-/**
- * Build a ready-to-use Api.InputDocumentFileLocation for a video Document.
- *
- * WHY THIS EXISTS: client.iterDownload({ file: <Api.Document> }) relies on
- * GramJS's internal FileLike -> InputFileLocation cast helper to recognize
- * a bare Api.Document and convert it. Depending on the exact installed
- * GramJS version, that helper may not have a case for a raw Document (it
- * commonly only recognizes MessageMediaDocument / Photo / already-cast
- * InputFileLocation types), which throws:
- *   "Cannot cast Document to any kind of InputFileLocation"
- * The one type every version of that cast helper accepts unconditionally
- * is an already-built Api.InputDocumentFileLocation (it's the terminal
- * type the helper is trying to produce), so we build it ourselves instead
- * of depending on GramJS's internal casting logic at all. This makes
- * downloads work identically across GramJS versions.
- *
- * `dcId` is intentionally NOT part of InputDocumentFileLocation's TL
- * schema, so callers must pass `doc.dcId` separately as iterDownload's
- * top-level `dcId` option - this is exactly what the internal cast helper
- * would have extracted from the Document for you.
- */
 function getFileLocation(doc) {
     if (!doc || doc.className !== "Document") {
         throw new Error("getFileLocation requires a real Api.Document");
@@ -362,23 +228,10 @@ function getFileLocation(doc) {
         id: doc.id,
         accessHash: doc.accessHash,
         fileReference: doc.fileReference,
-        thumbSize: "", // "" = full file, not a thumbnail
+        thumbSize: "", 
     });
 }
 
-/**
- * Check if a message contains playable video and return the underlying
- * Api.Document. Handles:
- *   - Native videos (DocumentAttributeVideo)
- *   - Documents uploaded as video/* mime type (no video attribute)
- *   - Forwarded messages (media shape is identical to originals in MTProto)
- *
- * Only ever returns a Document that is genuinely playable: it must be a
- * real Api.Document (not DocumentEmpty) with a valid, positive size. A
- * malformed/sizeless document would otherwise pass silently through here
- * and only surface as a confusing failure deep in the byte-range math in
- * routes/stream.js - better to catch and log it at the source.
- */
 function getVideoMedia(message) {
     if (!message || !message.media) {
         return null;
@@ -392,7 +245,6 @@ function getVideoMedia(message) {
 
     const doc = media.document;
 
-    // DocumentEmpty has no attributes/mimeType/size - not playable.
     if (doc.className !== "Document") {
         console.warn(`[telegram] Message media document is not a real Document (className=${doc.className}).`);
         return null;
@@ -427,7 +279,6 @@ module.exports = {
     getMessage,
     getVideoMedia,
     getFileLocation,
-    // Exposed for diagnostics / potential reuse elsewhere.
     resolveChannel,
     invalidateChannelCache,
 };
