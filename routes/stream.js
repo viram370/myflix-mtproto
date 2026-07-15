@@ -1,9 +1,3 @@
-/**
- * routes/stream.js
- * FIXED VERSION - Root cause addressed: premature client_disconnect via 'close' event
- * before first chunk (headers not flushed + slow first GetFile RPC).
- */
-
 const express = require("express");
 const router = express.Router();
 
@@ -14,8 +8,6 @@ const { Api } = require("telegram");
 
 const bigInt = require("big-integer");
 
-// ---------------------------------------------------------------------------
-// Config (unchanged)
 const MIN_CHUNK_SIZE = 4096;
 const MAX_CHUNK_SIZE = 1024 * 1024;
 const DEFAULT_CHUNK_SIZE = 512 * 1024;
@@ -31,32 +23,21 @@ const CHUNK_SIZE = resolveChunkSize();
 const METADATA_TIMEOUT_MS = 15000;
 const STALL_TIMEOUT_MS = 30000;
 const CHUNK_REQUEST_TIMEOUT_MS = 20000;
-
-// A file that keeps migrating more than this many times in a row is a sign
-// of something genuinely wrong (not a normal, one-hop FILE_MIGRATE) - bail
-// out instead of looping forever.
 const MAX_DC_MIGRATION_HOPS = 3;
-
 const VALID_ID_REGEX = /^[a-zA-Z0-9_-]+$/;
 
-// ---------------------------------------------------------------------------
-// DC migration (FILE_MIGRATE_X / NETWORK_MIGRATE_X) detection
-// ---------------------------------------------------------------------------
-/**
- * "The file to be accessed is currently stored in DC X" is Telegram's way
- * of failing upload.GetFile with an RPC error literally named
- * FILE_MIGRATE_<dcId> (or, less commonly, NETWORK_MIGRATE_<dcId>). Detects
- * that and extracts the target DC id (requirements 1 + 2).
- */
 function parseMigrateError(err) {
     const msg = (err && (err.errorMessage || err.message)) || "";
     const match = /^(FILE|NETWORK)_MIGRATE_(\d+)$/.exec(String(msg).trim());
-    if (!match) return null;
-    return { kind: match[1], dcId: parseInt(match[2], 10) };
+    if (match) return { kind: match[1], dcId: parseInt(match[2], 10) };
+    
+    // Fallback extraction to guarantee we never leak or throw the raw string
+    const stringMatch = /currently stored in DC (\d+)/i.exec(String(msg));
+    if (stringMatch) return { kind: 'FILE', dcId: parseInt(stringMatch[1], 10) };
+    
+    return null;
 }
 
-// ---------------------------------------------------------------------------
-// Logging (unchanged)
 function reqId() {
     return Math.random().toString(36).slice(2, 8);
 }
@@ -69,8 +50,6 @@ function log(rid, level, msg, meta) {
     else console.log(line, payload || "");
 }
 
-// ---------------------------------------------------------------------------
-// Utilities (unchanged)
 function toNumber(value) {
     if (value === null || value === undefined) return NaN;
     if (typeof value === "number") return value;
@@ -118,8 +97,6 @@ function parseRange(rangeHeader, totalSize) {
     return { start, end };
 }
 
-// ---------------------------------------------------------------------------
-// FIXED Route
 router.get("/:id", async (req, res) => {
     const rid = reqId();
     const startedAt = Date.now();
@@ -128,7 +105,6 @@ router.get("/:id", async (req, res) => {
     let aborted = false;
     let abortReason = null;
 
-    // Client-disconnect detection (improved guards)
     const onClose = () => {
         if (aborted) return;
         if (!res.writableEnded) {
@@ -174,7 +150,6 @@ router.get("/:id", async (req, res) => {
             }
         }
 
-        // Firestore + Telegram metadata (unchanged)
         log(rid, "info", "Loading Firestore document...", { id });
         let doc;
         try {
@@ -215,7 +190,6 @@ router.get("/:id", async (req, res) => {
 
         const mimeType = media.mimeType?.startsWith("video/") ? media.mimeType : "video/mp4";
 
-        // Parse Range
         let range;
         try {
             range = parseRange(req.headers.range, totalSize);
@@ -231,7 +205,6 @@ router.get("/:id", async (req, res) => {
         const end = range ? range.end : totalSize - 1;
         const contentLength = end - start + 1;
 
-        // Set headers
         res.set({
             "Accept-Ranges": "bytes",
             "Content-Type": mimeType,
@@ -246,17 +219,11 @@ router.get("/:id", async (req, res) => {
             res.status(200);
         }
 
-        // === CRITICAL FIX: Flush headers immediately ===
         res.flushHeaders();
         log(rid, "info", "Headers flushed to client - starting stream", {
-            id,
-            start,
-            end,
-            contentLength,
-            chunkSize: CHUNK_SIZE,
+            id, start, end, contentLength, chunkSize: CHUNK_SIZE,
         });
 
-        // Stream logic (unchanged - alignment, manual GetFile, integrity)
         const alignedStart = start - (start % CHUNK_SIZE);
         const skipBytes = start - alignedStart;
 
@@ -285,16 +252,25 @@ router.get("/:id", async (req, res) => {
 
         log(rid, "info", "Entering download loop", { id, aborted });
 
-        // The client actually used for GetFile calls. Starts as the home
-        // client for every request (requirement 10: "switch back
-        // automatically" falls out of this - each new request/file starts
-        // fresh here and only moves away from home if THIS file needs it),
-        // and is reassigned in place if/when this file turns out to live
-        // on a different DC, so every subsequent chunk of the SAME file
-        // reuses that same DC's client (requirements 3 + 9) instead of
-        // migrating again on every chunk.
         let activeClient = client;
         let activeDcId = client.session.dcId;
+        const fileDcId = media.dcId !== undefined ? media.dcId : activeDcId;
+
+        console.log(`[MTProto] Home DC: ${client.session.dcId}`);
+        console.log(`[MTProto] Current Client DC: ${activeDcId}`);
+        console.log(`[MTProto] File DC: ${fileDcId}`);
+
+        if (fileDcId !== activeDcId) {
+            try {
+                activeClient = await getClientForDC(fileDcId);
+                activeDcId = fileDcId;
+            } catch (migrationErr) {
+                log(rid, "error", "DC migration failed pre-emptively", { id, targetDc: fileDcId, message: migrationErr.message });
+                return res.status(500).json({ error: "DC migration failed" });
+            }
+        }
+
+        console.log("[MTProto] Starting download...");
 
         try {
             let offset = bigInt(alignedStart);
@@ -309,7 +285,7 @@ router.get("/:id", async (req, res) => {
                             CHUNK_REQUEST_TIMEOUT_MS,
                             `GetFile chunk #${chunkIndex}`
                         );
-                        break; // success - fall through to normal chunk handling below
+                        break; 
                     } catch (chunkErr) {
                         const migrate = parseMigrateError(chunkErr);
 
@@ -322,40 +298,26 @@ router.get("/:id", async (req, res) => {
                             log(rid, "error", "DC migration exceeded max hops - giving up", {
                                 id, chunkIndex, offset: offset.toString(), targetDc: migrate.dcId, hops: hop,
                             });
-                            throw chunkErr;
+                            throw new Error(`Migration exceeded max hops for DC ${migrate.dcId}`);
                         }
 
-                        // --- requirements 1, 2, 11, 12 ---------------------
-                        console.log(`[MTProto] Current DC: ${activeDcId}`);
-                        console.log(`[MTProto] Target DC: ${migrate.dcId}`);
-                        console.log(`[MTProto] Migrating...`);
+                        if (hop === 0 && fileDcId === activeDcId) {
+                            console.log(`[MTProto] File DC: ${migrate.dcId}`);
+                        }
+
                         log(rid, "warn", `${migrate.kind}_MIGRATE_${migrate.dcId} detected - switching client DC`, {
                             id, chunkIndex, currentDc: activeDcId, targetDc: migrate.dcId, offset: offset.toString(), hop: hop + 1,
                         });
 
-                        // --- requirements 3, 4, 5, 9 ------------------------
-                        // Reuse a cached client for that DC, or export the
-                        // current authorization and import it into a newly
-                        // created + cached client for that DC.
                         try {
                             activeClient = await getClientForDC(migrate.dcId);
                             activeDcId = migrate.dcId;
                         } catch (migrationErr) {
                             log(rid, "error", "DC migration failed", { id, targetDc: migrate.dcId, message: migrationErr.message });
-                            throw migrationErr;
+                            throw migrationErr; 
                         }
 
-                        console.log(`[MTProto] Migration successful`);
-                        console.log(`[MTProto] Resuming stream at offset ${offset.toString()}`);
                         log(rid, "info", "Resumed streaming on new DC", { id, chunkIndex, dc: activeDcId, offset: offset.toString() });
-
-                        // --- requirements 6, 7, 8 ---------------------------
-                        // Loop retries the EXACT same offset/limit against
-                        // the new client. The HTTP response is untouched -
-                        // nothing above this point closed or reset it, and
-                        // the Range/alignment math (start/end/alignedStart)
-                        // was already computed once, before the loop, so it
-                        // keeps working unchanged.
                     }
                 }
 
@@ -404,19 +366,20 @@ router.get("/:id", async (req, res) => {
         }
 
         res.end();
+        console.log("[MTProto] Download completed.");
         log(rid, "info", "Stream completed successfully", { id });
 
     } catch (err) {
         const migrate = parseMigrateError(err);
         if (migrate) {
-            // Only reachable if migration itself could not be completed
-            // (e.g. DC address/config lookup or export/import authorization
-            // failed) after MAX_DC_MIGRATION_HOPS attempts - a genuinely
-            // unrecoverable case, logged distinctly rather than as a
-            // generic "Unhandled stream error".
             log(rid, "error", "DC migration could not be completed", { id, targetDc: migrate.dcId, message: err.message });
         } else {
-            log(rid, "error", "Unhandled stream error", { id, message: err.message });
+            const msg = err.message || "";
+            if (msg.includes("currently stored in DC")) {
+                log(rid, "error", "DC migration could not be completed", { id, message: msg });
+            } else {
+                log(rid, "error", "Unhandled stream error", { id, message: msg });
+            }
         }
         if (!res.headersSent) res.status(500).json({ error: "Stream failed" });
         else if (!res.writableEnded) res.destroy(err);
