@@ -120,6 +120,33 @@ function isFloodWaitError(err) {
     return err && (err.className === "FloodWaitError" || typeof err.seconds === "number");
 }
 
+/**
+ * Telegram file references (the opaque `fileReference` blob baked into
+ * every InputDocumentFileLocation) expire — typically after roughly an
+ * hour, sometimes sooner if the source message is edited or forwarded.
+ * A long-running/paused-and-resumed stream can easily outlive that
+ * window mid-transfer, and Telegram answers with a hard RPC error rather
+ * than a graceful degrade. Retrying the exact same (now-stale) location
+ * can never succeed — the message has to be re-fetched so a fresh
+ * fileReference comes back from Telegram.
+ */
+function isFileReferenceExpiredError(err) {
+    const detail = describeError(err);
+    return /FILE_REFERENCE_EXPIRED|FILEREF_EXPIRED|FILE_REFERENCE_INVALID|FILE_REFERENCE_EMPTY/i.test(detail);
+}
+
+/**
+ * Re-fetches a message straight from Telegram, bypassing nothing (there
+ * is no message-level cache in this module — only the channel/peer
+ * lookup in resolveChannel is cached) so the returned document always
+ * carries a brand-new fileReference. Callers should call this and rebuild
+ * their InputDocumentFileLocation whenever isFileReferenceExpiredError()
+ * is true for a GetFile failure.
+ */
+async function refreshMessage(client, channelId, messageId) {
+    return getMessage(client, channelId, messageId);
+}
+
 function isRetryableCode(detail) {
     if (!detail) return false;
     return /TIMEOUT|CONNECTION|ECONNRESET|ETIMEDOUT|EAI_AGAIN|-500|-503|INTERNAL/i.test(detail);
@@ -329,4 +356,7 @@ module.exports = {
     invalidateChannelCache,
     extractFileName,
     resolveMimeType,
+    isFileReferenceExpiredError,
+    refreshMessage,
+    isFloodWaitError,
 };
