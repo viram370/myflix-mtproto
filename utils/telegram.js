@@ -275,10 +275,58 @@ function getVideoMedia(message) {
     return doc;
 }
 
+function extractFileName(doc) {
+    const attr = (doc?.attributes || []).find((a) => a.className === "DocumentAttributeFilename");
+    return attr?.fileName || null;
+}
+
+/**
+ * Telegram echoes back whatever mime type the UPLOADING client declared
+ * at send time, which is frequently wrong or generic
+ * ("application/octet-stream" is common for files sent as a plain
+ * Document rather than through the video picker). The previous version
+ * of this logic trusted that label outright whenever it happened to
+ * start with "video/", and forced everything else to "video/mp4" -
+ * which is exactly what turns a real MKV/WebM file into a broken/
+ * corrupted icon in Chrome: the browser is told "this is an MP4" and
+ * tries to parse an MP4 box structure against actual Matroska/WebM EBML
+ * data (or the reverse), and the demuxer fails outright.
+ *
+ * The filename extension is the most reliable signal available - it's
+ * literally the name the file was uploaded with - so it's checked FIRST
+ * and wins on conflict with the declared mime. The original container is
+ * always preserved; "video/mp4" is only ever used as an absolute last
+ * resort when neither the filename nor the mime gives a real answer.
+ */
+function resolveMimeType(doc) {
+    const fileName = extractFileName(doc);
+    const name = (fileName || "").toLowerCase();
+    const rawMime = (doc && doc.mimeType) || "";
+    const mime = rawMime.toLowerCase();
+
+    if (/\.mkv$/.test(name)) return { mimeType: "video/x-matroska", fileName };
+    if (/\.webm$/.test(name)) return { mimeType: "video/webm", fileName };
+    if (/\.mov$/.test(name)) return { mimeType: "video/quicktime", fileName };
+    if (/\.avi$/.test(name)) return { mimeType: "video/x-msvideo", fileName };
+    if (/\.(m4v|mp4)$/.test(name)) return { mimeType: "video/mp4", fileName };
+    if (/\.ts$/.test(name) || /\.m2ts$/.test(name)) return { mimeType: "video/mp2t", fileName };
+    if (/\.flv$/.test(name)) return { mimeType: "video/x-flv", fileName };
+
+    if (/matroska/.test(mime)) return { mimeType: "video/x-matroska", fileName };
+    if (/webm/.test(mime)) return { mimeType: "video/webm", fileName };
+    if (/quicktime/.test(mime)) return { mimeType: "video/quicktime", fileName };
+    if (/x-msvideo/.test(mime)) return { mimeType: "video/x-msvideo", fileName };
+    if (mime.startsWith("video/") && mime !== "video/octet-stream") return { mimeType: rawMime, fileName };
+
+    return { mimeType: "video/mp4", fileName }; // no reliable signal at all
+}
+
 module.exports = {
     getMessage,
     getVideoMedia,
     getFileLocation,
     resolveChannel,
     invalidateChannelCache,
+    extractFileName,
+    resolveMimeType,
 };
