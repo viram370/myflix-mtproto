@@ -2,8 +2,8 @@ const express = require("express");
 const router = express.Router();
 
 const { db } = require("../services/firebase");
-const { getMessage, getVideoMedia, getFileLocation } = require("../utils/telegram");
-const { getClientForDC } = require("../gramjs");
+const { getMessage, getVideoMedia, getFileLocation, resolveMimeType } = require("../utils/telegram");
+const { getClientForDC, getPrimaryDcId } = require("../gramjs");
 const { Api } = require("telegram");
 
 const bigInt = require("big-integer");
@@ -24,6 +24,8 @@ const METADATA_TIMEOUT_MS = 15000;
 const STALL_TIMEOUT_MS = 30000;
 const CHUNK_REQUEST_TIMEOUT_MS = 20000;
 const MAX_DC_MIGRATION_HOPS = 3;
+const CHUNK_MAX_RETRIES = 4; // per chunk, for transient (non-migration) failures
+const CHUNK_RETRY_BASE_DELAY_MS = 600;
 const VALID_ID_REGEX = /^[a-zA-Z0-9_-]+$/;
 
 function parseMigrateError(err) {
@@ -188,7 +190,8 @@ router.get("/:id", async (req, res) => {
             return res.status(500).json({ error: "Invalid media size" });
         }
 
-        const mimeType = media.mimeType?.startsWith("video/") ? media.mimeType : "video/mp4";
+        const { mimeType, fileName } = resolveMimeType(media);
+        const telegramMimeType = media.mimeType || "unknown";
 
         let range;
         try {
@@ -205,11 +208,18 @@ router.get("/:id", async (req, res) => {
         const end = range ? range.end : totalSize - 1;
         const contentLength = end - start + 1;
 
+        // Weak ETag tied to the actual source identity (channel + message +
+        // size) so a browser never reuses a cached range across a
+        // different underlying file, while still being safe to send
+        // repeatedly for the same one.
+        const etag = `W/"${video.channelId}-${video.messageId}-${totalSize}"`;
+
         res.set({
             "Accept-Ranges": "bytes",
             "Content-Type": mimeType,
             "Content-Length": String(contentLength),
-            "Cache-Control": "no-cache",
+            "Cache-Control": "private, max-age=3600",
+            ETag: etag,
         });
 
         if (range) {
@@ -218,6 +228,13 @@ router.get("/:id", async (req, res) => {
         } else {
             res.status(200);
         }
+
+        log(rid, "info", "Response headers prepared", {
+            id, contentType: mimeType, telegramMimeType, fileName: fileName || "unknown",
+            fileSize: totalSize, contentLength, httpStatus: range ? 206 : 200,
+            contentRange: range ? `bytes ${start}-${end}/${totalSize}` : "none",
+            acceptRanges: "bytes", etag,
+        });
 
         res.flushHeaders();
         log(rid, "info", "Headers flushed to client - starting stream", {
@@ -256,78 +273,108 @@ router.get("/:id", async (req, res) => {
         let activeDcId = client.session.dcId;
         const fileDcId = media.dcId !== undefined ? media.dcId : activeDcId;
 
-        console.log(`[MTProto] Home DC: ${client.session.dcId}`);
-        console.log(`[MTProto] Current Client DC: ${activeDcId}`);
-        console.log(`[MTProto] File DC: ${fileDcId}`);
+        log(rid, "info", "Data Center check", {
+            id, homeDc: getPrimaryDcId ? getPrimaryDcId() : client.session.dcId,
+            currentDc: activeDcId, telegramDc: fileDcId,
+        });
 
         if (fileDcId !== activeDcId) {
             try {
                 activeClient = await getClientForDC(fileDcId);
                 activeDcId = fileDcId;
+                log(rid, "info", "Pre-emptively switched to file's Data Center", { id, currentDc: activeDcId, telegramDc: fileDcId });
             } catch (migrationErr) {
                 log(rid, "error", "DC migration failed pre-emptively", { id, targetDc: fileDcId, message: migrationErr.message });
                 return res.status(500).json({ error: "DC migration failed" });
             }
         }
 
-        console.log("[MTProto] Starting download...");
+        log(rid, "info", "Starting download", { id, currentDc: activeDcId, telegramDc: fileDcId });
 
         try {
             let offset = bigInt(alignedStart);
             while (!aborted && bytesSent < contentLength) {
                 chunkIndex += 1;
+                const chunkOffsetStr = offset.toString();
                 let result;
+                let transientAttempt = 0;
 
-                for (let hop = 0; hop <= MAX_DC_MIGRATION_HOPS; hop++) {
+                transientRetry:
+                for (;;) {
+                    transientAttempt += 1;
                     try {
-                        result = await withTimeout(
-                            activeClient.invoke(new Api.upload.GetFile({ location: fileLocation, offset, limit: CHUNK_SIZE })),
-                            CHUNK_REQUEST_TIMEOUT_MS,
-                            `GetFile chunk #${chunkIndex}`
-                        );
-                        break; 
-                    } catch (chunkErr) {
-                        const migrate = parseMigrateError(chunkErr);
+                        for (let hop = 0; hop <= MAX_DC_MIGRATION_HOPS; hop++) {
+                            try {
+                                result = await withTimeout(
+                                    activeClient.invoke(new Api.upload.GetFile({ location: fileLocation, offset, limit: CHUNK_SIZE })),
+                                    CHUNK_REQUEST_TIMEOUT_MS,
+                                    `GetFile chunk #${chunkIndex}`
+                                );
+                                break;
+                            } catch (chunkErr) {
+                                const migrate = parseMigrateError(chunkErr);
 
-                        if (!migrate) {
-                            log(rid, "error", "GetFile failed", { id, chunkIndex, offset: offset.toString(), message: chunkErr.message });
-                            throw chunkErr;
+                                if (!migrate) throw chunkErr; // fall through to transient-retry handling below
+
+                                if (hop === MAX_DC_MIGRATION_HOPS) {
+                                    log(rid, "error", "DC migration exceeded max hops - giving up", {
+                                        id, chunkIndex, offset: chunkOffsetStr, targetDc: migrate.dcId, hops: hop,
+                                    });
+                                    throw new Error(`Migration exceeded max hops for DC ${migrate.dcId}`);
+                                }
+
+                                log(rid, "warn", `${migrate.kind}_MIGRATE_${migrate.dcId} detected - switching client DC`, {
+                                    id, chunkIndex, currentDc: activeDcId, targetDc: migrate.dcId, offset: chunkOffsetStr, hop: hop + 1,
+                                });
+
+                                try {
+                                    activeClient = await getClientForDC(migrate.dcId);
+                                    activeDcId = migrate.dcId;
+                                } catch (migrationErr) {
+                                    log(rid, "error", "DC migration failed", { id, targetDc: migrate.dcId, message: migrationErr.message });
+                                    throw migrationErr;
+                                }
+
+                                log(rid, "info", "Resumed streaming on new DC", { id, chunkIndex, dc: activeDcId, offset: chunkOffsetStr });
+                            }
                         }
-
-                        if (hop === MAX_DC_MIGRATION_HOPS) {
-                            log(rid, "error", "DC migration exceeded max hops - giving up", {
-                                id, chunkIndex, offset: offset.toString(), targetDc: migrate.dcId, hops: hop,
+                        break transientRetry; // got a result (or threw out of the whole loop above)
+                    } catch (err) {
+                        if (aborted) throw err;
+                        if (transientAttempt >= CHUNK_MAX_RETRIES) {
+                            log(rid, "error", "GetFile failed after retries - giving up", {
+                                id, chunkIndex, offset: chunkOffsetStr, attempts: transientAttempt, message: err.message,
                             });
-                            throw new Error(`Migration exceeded max hops for DC ${migrate.dcId}`);
+                            throw err;
                         }
-
-                        if (hop === 0 && fileDcId === activeDcId) {
-                            console.log(`[MTProto] File DC: ${migrate.dcId}`);
-                        }
-
-                        log(rid, "warn", `${migrate.kind}_MIGRATE_${migrate.dcId} detected - switching client DC`, {
-                            id, chunkIndex, currentDc: activeDcId, targetDc: migrate.dcId, offset: offset.toString(), hop: hop + 1,
+                        const delay = CHUNK_RETRY_BASE_DELAY_MS * transientAttempt;
+                        log(rid, "warn", "GetFile chunk failed - retrying same offset (no bytes written yet, so no risk of duplication)", {
+                            id, chunkIndex, offset: chunkOffsetStr, attempt: transientAttempt, maxAttempts: CHUNK_MAX_RETRIES,
+                            delayMs: delay, message: err.message,
                         });
-
-                        try {
-                            activeClient = await getClientForDC(migrate.dcId);
-                            activeDcId = migrate.dcId;
-                        } catch (migrationErr) {
-                            log(rid, "error", "DC migration failed", { id, targetDc: migrate.dcId, message: migrationErr.message });
-                            throw migrationErr; 
-                        }
-
-                        log(rid, "info", "Resumed streaming on new DC", { id, chunkIndex, dc: activeDcId, offset: offset.toString() });
+                        await new Promise((resolve) => setTimeout(resolve, delay));
                     }
                 }
 
                 if (result.className === "upload.FileCdnRedirect") throw new Error("CDN redirect unsupported");
 
                 const bytes = result.bytes;
-                if (!bytes || bytes.length === 0) break;
+                const rawChunkSize = bytes ? bytes.length : 0;
+                if (!bytes || rawChunkSize === 0) {
+                    log(rid, "info", "Telegram returned an empty chunk - end of file reached", {
+                        id, chunkIndex, offset: chunkOffsetStr, totalBytesSent: bytesSent, expectedBytes: contentLength,
+                    });
+                    break;
+                }
 
-                rawBytesReceived += bytes.length;
+                rawBytesReceived += rawChunkSize;
                 lastActivity = Date.now();
+
+                // Validate BEFORE writing: a chunk can never be larger than
+                // what was requested, and never negative after trimming.
+                if (rawChunkSize > CHUNK_SIZE) {
+                    throw new Error(`Chunk #${chunkIndex} returned ${rawChunkSize} bytes, more than the ${CHUNK_SIZE} requested - refusing to write`);
+                }
 
                 let piece = bytes;
                 if (isFirstChunk) {
@@ -338,21 +385,39 @@ router.get("/:id", async (req, res) => {
                 const remaining = contentLength - bytesSent;
                 if (piece.length > remaining) piece = piece.subarray(0, remaining);
 
+                if (piece.length < 0) {
+                    throw new Error(`Chunk #${chunkIndex} computed a negative length against remaining=${remaining} - refusing to write`);
+                }
+
+                let chunkBytesWritten = 0;
                 if (piece.length > 0) {
                     const canContinue = res.write(piece);
+                    chunkBytesWritten = piece.length;
                     bytesSent += piece.length;
                     lastActivity = Date.now();
                     if (!canContinue) await new Promise(resolve => res.once("drain", resolve));
                 }
 
+                log(rid, "info", "Chunk written", {
+                    id, chunkIndex, chunkOffset: chunkOffsetStr, expectedChunkSize: CHUNK_SIZE, actualChunkSize: rawChunkSize,
+                    bytesWritten: chunkBytesWritten, totalBytesSent: bytesSent, expectedBytes: contentLength,
+                });
+
+                // Advance by the RAW bytes Telegram actually returned (not
+                // the trimmed piece length) so the next GetFile offset stays
+                // exactly aligned with what's already been consumed - this
+                // is what guarantees no byte is ever skipped, duplicated, or
+                // re-ordered across chunks.
                 offset = offset.add(bytes.length);
-                if (bytes.length < CHUNK_SIZE) break;
+                if (bytes.length < CHUNK_SIZE) break; // short read = genuine EOF
             }
         } finally {
             clearInterval(stallGuard);
         }
 
-        log(rid, "info", "Stream finished", { id, bytesSent, contentLength });
+        log(rid, "info", "Stream finished", {
+            id, totalBytesSent: bytesSent, rawBytesDownloaded: rawBytesReceived, expectedBytes: contentLength,
+        });
 
         if (aborted) {
             if (!res.writableEnded) res.destroy(new Error(`Aborted: ${abortReason}`));
@@ -360,14 +425,17 @@ router.get("/:id", async (req, res) => {
         }
 
         if (bytesSent !== contentLength) {
-            log(rid, "error", "Integrity failure", { id, bytesSent, contentLength });
+            log(rid, "error", "Integrity failure - bytesWritten does not match Content-Length, aborting rather than sending a corrupted stream", {
+                id, totalBytesSent: bytesSent, expectedBytes: contentLength,
+            });
             if (!res.writableEnded) res.destroy(new Error("Byte count mismatch"));
             return;
         }
 
         res.end();
-        console.log("[MTProto] Download completed.");
-        log(rid, "info", "Stream completed successfully", { id });
+        log(rid, "info", "Stream completed successfully - bytesWritten matches Content-Length exactly", {
+            id, totalBytesSent: bytesSent, expectedBytes: contentLength,
+        });
 
     } catch (err) {
         const migrate = parseMigrateError(err);
