@@ -2,7 +2,15 @@ const express = require("express");
 const router = express.Router();
 
 const { db } = require("../services/firebase");
-const { getMessage, getVideoMedia, getFileLocation, resolveMimeType } = require("../utils/telegram");
+const {
+    getMessage,
+    getVideoMedia,
+    getFileLocation,
+    resolveMimeType,
+    isFileReferenceExpiredError,
+    refreshMessage,
+    isFloodWaitError,
+} = require("../utils/telegram");
 const { getClientForDC, getPrimaryDcId } = require("../gramjs");
 const { Api } = require("telegram");
 
@@ -244,6 +252,9 @@ router.get("/:id", async (req, res) => {
         const alignedStart = start - (start % CHUNK_SIZE);
         const skipBytes = start - alignedStart;
 
+        // `let`, not `const` — rebuilt in place below whenever Telegram
+        // reports the current fileReference has expired mid-stream, so
+        // every subsequent chunk in the download loop uses the fresh one.
         let fileLocation;
         try {
             fileLocation = getFileLocation(media);
@@ -341,6 +352,43 @@ router.get("/:id", async (req, res) => {
                         break transientRetry; // got a result (or threw out of the whole loop above)
                     } catch (err) {
                         if (aborted) throw err;
+
+                        if (isFileReferenceExpiredError(err)) {
+                            log(rid, "warn", "fileReference expired mid-stream - refreshing from Telegram", {
+                                id, chunkIndex, offset: chunkOffsetStr, attempt: transientAttempt,
+                            });
+                            try {
+                                const freshMessage = await refreshMessage(activeClient, video.channelId, video.messageId);
+                                const freshMedia = freshMessage && getVideoMedia(freshMessage);
+                                if (!freshMedia) {
+                                    throw new Error("Source media disappeared while refreshing fileReference");
+                                }
+                                fileLocation = getFileLocation(freshMedia);
+                                log(rid, "info", "fileReference refreshed - retrying chunk", { id, chunkIndex, offset: chunkOffsetStr });
+                                // Doesn't count against the transient-retry budget or sleep -
+                                // we already know exactly why it failed and have a fix in hand.
+                                continue transientRetry;
+                            } catch (refreshErr) {
+                                log(rid, "error", "Failed to refresh expired fileReference", {
+                                    id, chunkIndex, message: refreshErr.message,
+                                });
+                                if (transientAttempt >= CHUNK_MAX_RETRIES) throw refreshErr;
+                                const delay = CHUNK_RETRY_BASE_DELAY_MS * transientAttempt;
+                                await new Promise((resolve) => setTimeout(resolve, delay));
+                                continue transientRetry;
+                            }
+                        }
+
+                        if (isFloodWaitError(err)) {
+                            const waitMs = ((err && err.seconds) || 5) * 1000;
+                            log(rid, "warn", "FLOOD_WAIT hit mid-stream - waiting before retry", {
+                                id, chunkIndex, offset: chunkOffsetStr, waitMs,
+                            });
+                            if (transientAttempt >= CHUNK_MAX_RETRIES) throw err;
+                            await new Promise((resolve) => setTimeout(resolve, waitMs));
+                            continue transientRetry;
+                        }
+
                         if (transientAttempt >= CHUNK_MAX_RETRIES) {
                             log(rid, "error", "GetFile failed after retries - giving up", {
                                 id, chunkIndex, offset: chunkOffsetStr, attempts: transientAttempt, message: err.message,
