@@ -14,6 +14,18 @@ app.use(express.json());
 // Stream Route
 app.use("/api/stream", require("./routes/stream"));
 
+// Videos Route (metadata lookup)
+// FIX: this router was fully implemented in routes/videos.js but was
+// never mounted here, so every request to /api/videos/:id 404'd
+// unconditionally (Express has no route for it at all - not even a
+// controller-level 404, just "Cannot GET /api/videos/xyz"). Any client
+// flow that calls this endpoint first to fetch metadata (title,
+// mimeType, size, telegramDocumentId, etc.) before attempting playback
+// would treat that 404 as "video unavailable" and render it as a
+// broken/corrupted video icon even though the underlying Telegram
+// message and /api/stream/:id endpoint were perfectly fine.
+app.use("/api/videos", require("./routes/videos"));
+
 // Health Check
 app.get("/", (req, res) => {
     res.json({
